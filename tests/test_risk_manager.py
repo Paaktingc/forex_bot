@@ -1,75 +1,245 @@
 """
 test_risk_manager.py
 
-Unit tests for the risk_manager.py module.
+Comprehensive unit tests for the RiskManager class.
+Tests boundary conditions (at, just-under, just-over) for every check,
+midnight reset of daily balance, martingale prevention, SL/TP maths,
+and the can_trade gate.
 """
 
-import pytest
-from datetime import datetime, timedelta
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch, MagicMock
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+import pytest
 
-import risk_manager
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from risk_manager import RiskManager, is_rollover_window
 import config
 
-def test_calculate_position_size():
-    equity = 10000
-    # Risk = 10000 * 0.0075 = $75
-    entry = 1.1000
-    sl = 1.0950 # 50 pips / 0.0050 difference
-    # risk_per_unit = 0.0050
-    # units = 75 / 0.0050 = 15000 units
-    # lots = 15000 / 100000 = 0.15 lots
-    
-    lots = risk_manager.calculate_position_size(equity, entry, sl)
-    assert lots == 0.15
-    
-    # Zero risk test
-    assert risk_manager.calculate_position_size(equity, entry, entry) == 0.0
+UTC = timezone.utc
+BALANCE = 10_000.0
 
-def test_check_daily_loss_limit():
-    initial_equity = 10000
-    # 4% of 10000 is 400. Loss limit at 9600.
-    
-    # Allowed
-    assert risk_manager.check_daily_loss_limit(initial_equity, 9700) == True
-    
-    # Not allowed (hit exactly 4%)
-    assert risk_manager.check_daily_loss_limit(initial_equity, 9600) == False
-    
-    # Not allowed (exceeded 4%)
-    assert risk_manager.check_daily_loss_limit(initial_equity, 9500) == False
 
-def test_check_absolute_drawdown():
-    starting_balance = 10000
-    # 4.5% of 10000 is 450. Limit at 9550.
-    
-    assert risk_manager.check_absolute_drawdown(starting_balance, 9600) == True
-    assert risk_manager.check_absolute_drawdown(starting_balance, 9550) == False
-    assert risk_manager.check_absolute_drawdown(starting_balance, 9000) == False
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
-def test_check_rollover_window():
-    # Rollover is 21:00 to 22:00
-    allowed_time = datetime(2023, 1, 1, 20, 30)
-    blocked_time = datetime(2023, 1, 1, 21, 30)
-    edge_case = datetime(2023, 1, 1, 22, 0)
-    
-    assert risk_manager.check_rollover_window(allowed_time) == True
-    assert risk_manager.check_rollover_window(blocked_time) == False
-    assert risk_manager.check_rollover_window(edge_case) == True
+@pytest.fixture
+def rm():
+    """Fresh RiskManager with $10 000 starting balance."""
+    return RiskManager(BALANCE)
 
-def test_check_max_concurrent_trades():
-    assert risk_manager.check_max_concurrent_trades(1) == True
-    assert risk_manager.check_max_concurrent_trades(2) == False
-    assert risk_manager.check_max_concurrent_trades(3) == False
 
-def test_check_order_delay():
-    last_time = datetime(2023, 1, 1, 12, 0, 0)
-    
-    # 1 second later
-    assert risk_manager.check_order_delay(last_time, last_time + timedelta(seconds=1)) == False
-    
-    # 3 seconds later
-    assert risk_manager.check_order_delay(last_time, last_time + timedelta(seconds=3)) == True
+# ---------------------------------------------------------------------------
+# check_absolute_drawdown
+# ---------------------------------------------------------------------------
+
+class TestCheckAbsoluteDrawdown:
+    # MAX_DRAWDOWN_PCT = 4.5 %  →  limit at 9 550.00
+    _limit_equity = BALANCE * (1 - config.MAX_DRAWDOWN_PCT)   # 9 550.00
+
+    def test_just_under_limit_allowed(self, rm):
+        equity = self._limit_equity + 0.01   # 9 550.01 → 4.4999 %
+        assert rm.check_absolute_drawdown(equity) is True
+
+    def test_exactly_at_limit_halts(self, rm):
+        with patch("execution.close_all_positions") as mock_close:
+            assert rm.check_absolute_drawdown(self._limit_equity) is False
+            mock_close.assert_called_once()
+
+    def test_over_limit_halts(self, rm):
+        with patch("execution.close_all_positions") as mock_close:
+            equity = self._limit_equity - 100
+            assert rm.check_absolute_drawdown(equity) is False
+            mock_close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# check_daily_loss
+# ---------------------------------------------------------------------------
+
+class TestCheckDailyLoss:
+    # DAILY_LOSS_PCT = 4.0 %  →  limit at 9 600.00
+    _limit_equity = BALANCE * (1 - config.DAILY_LOSS_PCT)   # 9 600.00
+
+    def test_just_under_limit_allowed(self, rm):
+        equity = self._limit_equity + 0.01   # 9 600.01
+        assert rm.check_daily_loss(equity) is True
+
+    def test_exactly_at_limit_halts(self, rm):
+        assert rm.check_daily_loss(self._limit_equity) is False
+        assert rm.halted_today is True
+
+    def test_over_limit_halts(self, rm):
+        assert rm.check_daily_loss(self._limit_equity - 100) is False
+        assert rm.halted_today is True
+
+    def test_subsequent_calls_blocked_when_halted(self, rm):
+        rm.halted_today = True
+        # Even if equity recovers, trading stays blocked for the day
+        assert rm.check_daily_loss(BALANCE + 500) is False
+
+    def test_midnight_reset_clears_halt(self, rm):
+        rm.halted_today = True
+        # Simulate daily_start_time being yesterday
+        rm.daily_start_time = datetime.now(UTC) - timedelta(days=1)
+        # First call should reset halted_today
+        rm._maybe_reset_daily()
+        assert rm.halted_today is False
+
+    def test_midnight_reset_updates_start_time(self, rm):
+        old_date = datetime.now(UTC).date() - timedelta(days=1)
+        rm.daily_start_time = datetime(old_date.year, old_date.month, old_date.day,
+                                       tzinfo=UTC)
+        rm._maybe_reset_daily()
+        assert rm.daily_start_time.date() == datetime.now(UTC).date()
+
+
+# ---------------------------------------------------------------------------
+# calculate_lot_size
+# ---------------------------------------------------------------------------
+
+class TestCalculateLotSize:
+    def test_standard_calculation(self, rm):
+        # equity=10000, risk=75, sl_pips=50, pip_val=10 → lot=0.15
+        lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD")
+        assert lot == 0.15
+
+    def test_entry_equals_sl_returns_zero(self, rm):
+        lot = rm.calculate_lot_size(10_000, 1.1000, 1.1000, "EURUSD")
+        assert lot == 0.0
+
+    def test_minimum_clamp(self, rm):
+        # Tiny equity / wide SL → lot would be near-zero → clamped to 0.01
+        lot = rm.calculate_lot_size(10, 1.0000, 1.5000, "EURUSD")
+        assert lot == 0.01
+
+    def test_maximum_clamp(self, rm):
+        # Massive equity / tiny SL → lot > 5.0 → clamped to 5.0
+        lot = rm.calculate_lot_size(10_000_000, 1.0999, 1.1000, "EURUSD")
+        assert lot == 5.0
+
+    def test_martingale_prevention(self, rm):
+        # Simulate a loss: equity dropped since last trade
+        rm._last_lot_size = 0.10
+        rm._last_equity_at_lot = 10_000.0   # previous equity was higher
+
+        # New equity is lower, so we calculate a size – but it must not exceed 0.10
+        lot = rm.calculate_lot_size(9_500, 1.0950, 1.1000, "EURUSD")
+        # risk=71.25, sl_pips=50 → uncapped lot=0.14 → capped to 0.10
+        assert lot <= 0.10
+
+    def test_no_martingale_cap_on_profit(self, rm):
+        # Equity grew since last trade → no cap applied
+        rm._last_lot_size = 0.05
+        rm._last_equity_at_lot = 9_000.0   # previous equity was lower
+
+        lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD")
+        # uncapped = 0.15; previous lot was 0.05 (smaller) → cap doesn't kick in
+        assert lot == 0.15
+
+
+# ---------------------------------------------------------------------------
+# calculate_sl_tp
+# ---------------------------------------------------------------------------
+
+class TestCalculateSlTp:
+    # ATR = 0.0010, SL_MULT=1.0, TP_MULT=1.5
+    _atr = 0.0010
+    _entry = 1.10000
+
+    def test_buy_sl_below_tp_above(self, rm):
+        sl, tp = rm.calculate_sl_tp(1, self._entry, self._atr)
+        expected_sl = round(self._entry - config.SL_ATR_MULT * self._atr, 5)
+        expected_tp = round(self._entry + config.TP_ATR_MULT * self._atr, 5)
+        assert sl == expected_sl
+        assert tp == expected_tp
+        assert sl < self._entry < tp
+
+    def test_sell_sl_above_tp_below(self, rm):
+        sl, tp = rm.calculate_sl_tp(-1, self._entry, self._atr)
+        expected_sl = round(self._entry + config.SL_ATR_MULT * self._atr, 5)
+        expected_tp = round(self._entry - config.TP_ATR_MULT * self._atr, 5)
+        assert sl == expected_sl
+        assert tp == expected_tp
+        assert tp < self._entry < sl
+
+    def test_rounding_to_5dp(self, rm):
+        sl, tp = rm.calculate_sl_tp(1, 1.123456789, 0.0003333)
+        assert len(str(sl).split(".")[-1]) <= 5
+        assert len(str(tp).split(".")[-1]) <= 5
+
+
+# ---------------------------------------------------------------------------
+# can_trade
+# ---------------------------------------------------------------------------
+
+class TestCanTrade:
+    def test_all_clear(self, rm):
+        with patch("risk_manager.is_rollover_window", return_value=False):
+            ok, msg = rm.can_trade(BALANCE, 0)
+        assert ok is True
+        assert msg == "OK"
+
+    def test_drawdown_breach(self, rm):
+        equity = BALANCE * (1 - config.MAX_DRAWDOWN_PCT) - 1
+        with patch("execution.close_all_positions"):
+            ok, msg = rm.can_trade(equity, 0)
+        assert ok is False
+        assert msg == "MAX DRAWDOWN HIT"
+
+    def test_daily_loss_breach(self, rm):
+        equity = BALANCE * (1 - config.DAILY_LOSS_PCT) - 1
+        with patch("risk_manager.is_rollover_window", return_value=False):
+            ok, msg = rm.can_trade(equity, 0)
+        assert ok is False
+        assert msg == "DAILY LOSS LIMIT HIT"
+
+    def test_rollover_window(self, rm):
+        with patch("risk_manager.is_rollover_window", return_value=True):
+            ok, msg = rm.can_trade(BALANCE, 0)
+        assert ok is False
+        assert msg == "ROLLOVER WINDOW"
+
+    def test_max_trades_open(self, rm):
+        with patch("risk_manager.is_rollover_window", return_value=False):
+            ok, msg = rm.can_trade(BALANCE, config.MAX_OPEN_TRADES)
+        assert ok is False
+        assert msg == "MAX TRADES OPEN"
+
+    def test_priority_drawdown_before_daily(self, rm):
+        """Absolute drawdown takes priority over daily loss."""
+        equity = BALANCE * (1 - config.MAX_DRAWDOWN_PCT) - 1
+        with patch("execution.close_all_positions"):
+            ok, msg = rm.can_trade(equity, 0)
+        assert msg == "MAX DRAWDOWN HIT"
+
+
+# ---------------------------------------------------------------------------
+# is_rollover_window
+# ---------------------------------------------------------------------------
+
+class TestIsRolloverWindow:
+    def test_inside_window(self):
+        inside_hour = config.ROLLOVER_START_UTC
+        fake_now = datetime(2023, 1, 1, inside_hour, 30, tzinfo=UTC)
+        with patch("risk_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            assert is_rollover_window() is True
+
+    def test_outside_window_before(self):
+        outside_hour = config.ROLLOVER_START_UTC - 1
+        fake_now = datetime(2023, 1, 1, outside_hour, 59, tzinfo=UTC)
+        with patch("risk_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            assert is_rollover_window() is False
+
+    def test_outside_window_after(self):
+        outside_hour = config.ROLLOVER_END_UTC
+        fake_now = datetime(2023, 1, 1, outside_hour, 0, tzinfo=UTC)
+        with patch("risk_manager.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            assert is_rollover_window() is False

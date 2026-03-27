@@ -2,8 +2,7 @@
 config.py
 
 Centralized configuration file for the MT5 Forex ML bot.
-Contains all constants, risk parameters, 5ers rules, and model settings.
-Never hardcode these values in other modules.
+Contains all constants, risk parameters, and model settings.
 """
 
 import os
@@ -15,38 +14,49 @@ DATA_DIR = BASE_DIR / "data"
 MODELS_DIR = BASE_DIR / "models"
 LOGS_DIR = BASE_DIR / "logs"
 
+# Ensure directories exist
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
+
 # Trading Setup
 SYMBOL = "EURUSD"
-PRIMARY_TIMEFRAME = "M15"
-TREND_TIMEFRAME = "H1"
+TIMEFRAME_PRIMARY = "M15"
+TIMEFRAME_TREND = "H1"
+BARS_TO_FETCH = 35000
 
 # Risk Management & The5ers Hard Rules
-PROFIT_TARGET_PCT = 0.06           # 6% per phase
-MAX_DRAWDOWN_ABSOLUTE_PCT = 0.05   # 5% absolute from starting balance
-DAILY_LOSS_LIMIT_PCT = 0.05        # 5% daily loss limit
-DAILY_LOSS_KILL_SWITCH_PCT = 0.04  # Halt trading at 4% daily loss
-DRAWDOWN_KILL_SWITCH_PCT = 0.045   # Halt trading at 4.5% absolute drawdown
-RISK_PER_TRADE_PCT = 0.0075        # 0.75% of account equity per trade
-MAX_CONCURRENT_TRADES = 2          # Maximum 2 concurrent open trades
+STARTING_BALANCE = None
+MAX_DRAWDOWN_PCT = 0.045
+DAILY_LOSS_PCT = 0.040
+RISK_PER_TRADE_PCT = 0.0075
 
 # Stop Loss / Take Profit (ATR Multipliers)
-ATR_PERIOD = 14
-SL_ATR_MULTIPLIER = 1.0
-TP_ATR_MULTIPLIER = 1.5
-MIN_RR_RATIO = 1.5                 # 1:1.5 minimum
+SL_ATR_MULT = 1.0
+TP_ATR_MULT = 1.5
+MIN_CONFIDENCE = 0.65
 
 # Execution Limits
-MIN_TRADE_DURATION_SECONDS = 60    # NO HFT: Minimum 60s trade duration
-ORDER_DELAY_SECONDS = 2            # NO bulk orders: 2s delay between entries
-ROLLOVER_START_UTC = "21:00"       # Rollover window start UTC
-ROLLOVER_END_UTC = "22:00"         # Rollover window end UTC
+MAX_OPEN_TRADES = 2
+MIN_TRADE_DURATION = 60
+NEWS_BUFFER_MINS = 30
+ROLLOVER_START_UTC = 21
+ROLLOVER_END_UTC = 22
+BOT_MAGIC_NUMBER = 123456
 
-HIGH_IMPACT_NEWS_BLOCK_MINUTES = 30 # No trading 30 mins before/after high impact news
+# Trading Sessions
+LONDON_START_UTC = 7
+LONDON_END_UTC = 16
+NY_START_UTC = 13
+NY_END_UTC = 21
 
-# ML Model Parameters
-CONFIDENCE_THRESHOLD = 0.65        # Minimum signal confidence for entry
-STAGE_1_MODEL_NAME = "xgboost_model.json"
-STAGE_2_MODEL_NAME = "lstm_model.h5"
+# Triple Barrier Labelling Parameters
+TRIPLE_BARRIER_UPPER_MULT = 1.5
+TRIPLE_BARRIER_LOWER_MULT = 1.0
+TRIPLE_BARRIER_TIME_LIMIT = 20
 
-# Logging configuration
-LOG_FILE = LOGS_DIR / "trading_bot.log"
+# Paths
+MODEL_PATH = str(MODELS_DIR / "model.pkl")
+ENCODER_PATH = str(MODELS_DIR / "label_encoder.pkl")
+LOG_PATH = str(LOGS_DIR / "bot.log")
+JOURNAL_PATH = "trades_log.csv"

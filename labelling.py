@@ -1,104 +1,179 @@
 """
 labelling.py
 
-Generates target variables for the ML models by simulating 
-whether a trade hits TP before SL based on future price action.
+Generates target variables for the ML models by using a triple-barrier 
+labelling method. Also contains utilities to process data, prepare 
+training sequences, handle class imbalance via downsampling, and persist data.
 """
 
 import logging
+import os
 import pandas as pd
 import numpy as np
 import config
+from sklearn.preprocessing import LabelEncoder
+from features import FEATURE_COLS
 
 logger = logging.getLogger(__name__)
 
-def create_labels(df: pd.DataFrame, lookforward: int = 100) -> pd.DataFrame:
+def apply_triple_barrier(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Creates target labels for ML training.
+    Applies the triple-barrier method to generate target labels.
+    
+    Barriers:
+    1. Upper: entry + (TRIPLE_BARRIER_UPPER_MULT * ATR_14)
+    2. Lower: entry - (TRIPLE_BARRIER_LOWER_MULT * ATR_14)
+    3. Time: Next TRIPLE_BARRIER_TIME_LIMIT candles
+    
     Logic:
-      If long TP is hit before long SL -> Class 1 (Buy)
-      If short TP is hit before short SL -> Class 2 (Sell)
-      Otherwise -> Class 0 (Hold/Loss)
-      
+      - First hit upper -> label 1 (Buy)
+      - First hit lower -> label -1 (Sell)
+      - Hit time limit or neither -> label 0 (No trade)
+    
     Args:
-        df (pd.DataFrame): DataFrame with features, including 'ATR_14'.
-        lookforward (int): Number of future candles to look ahead for TP/SL.
+        df: DataFrame containing features, 'close', and 'atr_14'.
         
     Returns:
-        pd.DataFrame: DataFrame with a new 'target' column.
+        DataFrame with an added 'label' column.
     """
-    try:
-        if df.empty or len(df) <= lookforward:
-            logger.warning("DataFrame too small to create labels.")
-            return df
-            
-        df_labels = df.copy()
-        target = np.zeros(len(df_labels), dtype=int)
-        
-        # We need ATR for TP/SL calculations. Fallback if not found.
-        atr_col = [c for c in df_labels.columns if 'ATR' in c]
-        if not atr_col:
-            logger.error("ATR column not found. Run features.py first.")
-            return df_labels
-        
-        atr_col_name = atr_col[0]
-        
-        closes = df_labels['close'].values
-        highs = df_labels['high'].values
-        lows = df_labels['low'].values
-        atrs = df_labels[atr_col_name].values
-        
-        for i in range(len(df_labels) - lookforward):
-            entry_price = closes[i]
-            atr = atrs[i]
-            
-            if pd.isna(atr) or atr <= 0:
-                continue
-                
-            long_tp = entry_price + (atr * config.TP_ATR_MULTIPLIER)
-            long_sl = entry_price - (atr * config.SL_ATR_MULTIPLIER)
-            
-            short_tp = entry_price - (atr * config.TP_ATR_MULTIPLIER)
-            short_sl = entry_price + (atr * config.SL_ATR_MULTIPLIER)
-            
-            long_outcome = 0
-            short_outcome = 0
-            
-            # Forward look
-            for j in range(i + 1, i + lookforward):
-                future_high = highs[j]
-                future_low = lows[j]
-                
-                # Check Long
-                if long_outcome == 0:
-                    if future_low <= long_sl:
-                        long_outcome = -1 # SL hit
-                    elif future_high >= long_tp:
-                        long_outcome = 1 # TP hit
-                        
-                # Check Short
-                if short_outcome == 0:
-                    if future_high >= short_sl:
-                        short_outcome = -1 # SL hit
-                    elif future_low <= short_tp:
-                        short_outcome = 1 # TP hit
-                        
-                if long_outcome != 0 and short_outcome != 0:
-                    break
-                    
-            if long_outcome == 1 and short_outcome <= 0:
-                target[i] = 1
-            elif short_outcome == 1 and long_outcome <= 0:
-                target[i] = 2
-                
-        df_labels['target'] = target
-        
-        # Drop the last 'lookforward' rows as their targets are unknown/invalid
-        df_labels = df_labels.iloc[:-lookforward].copy()
-        
-        logger.info(f"Successfully created labels. Buy: {(target==1).sum()}, Sell: {(target==2).sum()}, Hold: {(target==0).sum()}")
-        return df_labels
-        
-    except Exception as e:
-        logger.error(f"Exception during target labelling: {str(e)}")
+    df = df.copy()
+    if df.empty or 'close' not in df.columns or 'atr_14' not in df.columns:
+        logger.warning("Missing required columns ('close', 'atr_14') or DataFrame empty.")
         return df
+
+    upper_mult = config.TRIPLE_BARRIER_UPPER_MULT
+    lower_mult = config.TRIPLE_BARRIER_LOWER_MULT
+    time_limit = config.TRIPLE_BARRIER_TIME_LIMIT
+    
+    labels = np.zeros(len(df), dtype=int)
+    
+    closes = df['close'].values
+    atrs = df['atr_14'].values
+    highs = df.get('high', df['close']).values
+    lows = df.get('low', df['close']).values
+
+    for i in range(len(df) - time_limit):
+        entry = closes[i]
+        atr = atrs[i]
+        
+        if pd.isna(atr) or atr <= 0:
+            labels[i] = 0
+            continue
+            
+        upper = entry + upper_mult * atr
+        lower = entry - lower_mult * atr
+        
+        label = 0
+        for j in range(i + 1, i + 1 + time_limit):
+            # To be more precise, we check high/low for touches or just close. 
+            # Prompt specifies: "first future close >= upper -> label = 1, first future close <= lower -> label = -1"
+            # Using close as per the prompt instructions.
+            future_close = closes[j]
+            
+            if future_close >= upper:
+                label = 1
+                break
+            elif future_close <= lower:
+                label = -1
+                break
+                
+        labels[i] = label
+
+    df['label'] = labels
+    
+    # Drop last TIME_LIMIT rows to avoid lookahead bias
+    return df.iloc[:-time_limit].copy()
+
+def get_label_distribution(df: pd.DataFrame) -> dict:
+    """
+    Returns and prints the count and percentage of -1, 0, 1 labels.
+    """
+    if 'label' not in df.columns:
+        return {}
+        
+    counts = df['label'].value_counts().to_dict()
+    total = len(df)
+    
+    distribution = {}
+    for label_val in [-1, 0, 1]:
+        count = counts.get(label_val, 0)
+        pct = (count / total * 100) if total > 0 else 0
+        distribution[label_val] = {'count': count, 'percentage': pct}
+        
+    logger.info("Label Distribution:")
+    for lbl, stats in distribution.items():
+        logger.info(f"Class {lbl}: {stats['count']} ({stats['percentage']:.2f}%)")
+        
+    return distribution
+
+def prepare_training_data(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray, LabelEncoder]:
+    """
+    Extracts features and target, encodes labels, and downsamples 
+    the majority class (0) if there's significant imbalance.
+    
+    Args:
+        df: DataFrame containing FEATURE_COLS and 'label'.
+        
+    Returns:
+        X (DataFrame): Features.
+        y_encoded (np.ndarray): Target classes (0, 1, 2).
+        le (LabelEncoder): Fitted encoder mapping original to new labels.
+    """
+    # Filter only available feature cols
+    missing_cols = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing_cols:
+        logger.warning(f"Missing FEATURE_COLS in df: {missing_cols}")
+        
+    valid_feature_cols = [c for c in FEATURE_COLS if c in df.columns]
+    
+    # Drop rows with NaN in features or label
+    df_clean = df.dropna(subset=valid_feature_cols + ['label']).copy()
+    
+    X = df_clean[valid_feature_cols]
+    y = df_clean['label'].values
+    
+    # Downsample if class 0 is overly dominant (> 10:1 ratio)
+    counts = pd.Series(y).value_counts()
+    count_0 = counts.get(0, 0)
+    count_others = max(1, len(y) - count_0)
+    
+    if count_0 / count_others > 10:
+        logger.info("Significant class imbalance detected. Downsampling class 0.")
+        target_0_count = count_others * 2  # Keep 2:1 ratio max against others, or simply 10:1 if strictly needed.
+        # Downsample to 10:1 to keep within limits, or match majority closely.
+        target_0_count = count_others * 10
+        
+        idx_0 = np.where(y == 0)[0]
+        idx_others = np.where(y != 0)[0]
+        
+        np.random.seed(42)  # For reproducibility
+        target_0_count = min(target_0_count, len(idx_0))
+        idx_0_sampled = np.random.choice(idx_0, size=target_0_count, replace=False)
+        
+        selected_idx = np.sort(np.concatenate([idx_0_sampled, idx_others]))
+        X = X.iloc[selected_idx]
+        y = y[selected_idx]
+    
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+    
+    return X, y_encoded, le
+
+def save_prepared_data(X: pd.DataFrame, y: np.ndarray, le: LabelEncoder) -> None:
+    """
+    Saves features, target, and the label encoder to disk.
+    
+    Args:
+        X: Feature dataframe.
+        y: Encoded target array.
+        le: Fitted LabelEncoder.
+    """
+    import pickle
+    
+    X.to_csv(config.DATA_DIR / "X_train.csv", index=False)
+    np.save(config.DATA_DIR / "y_train.npy", y)
+    
+    with open(config.ENCODER_PATH, 'wb') as f:
+        pickle.dump(le, f)
+        
+    logger.info(f"Saved prepared data and encoder to {config.DATA_DIR} and {config.MODELS_DIR}")

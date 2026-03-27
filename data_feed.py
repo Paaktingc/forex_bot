@@ -1,137 +1,168 @@
 """
 data_feed.py
-
-Handles connecting to MetaTrader 5 (MT5), fetching historical market data,
-and retrieving real-time ticks.
 """
 
 import os
 import logging
-from typing import Optional, Dict, Any
 import pandas as pd
 import MetaTrader5 as mt5
+from typing import Dict, Any
 from dotenv import load_dotenv
-import config
 
 # Setup logging
 logging.basicConfig(
-    filename=config.LOG_FILE,
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
-
-def connect_mt5() -> bool:
-    """
-    Connects to the MetaTrader 5 terminal using credentials from .env.
-    
-    Returns:
-        bool: True if connection is successful, False otherwise.
-    """
-    path = os.getenv("MT5_PATH")
-    server = os.getenv("MT5_SERVER")
-    login_str = os.getenv("MT5_ACCOUNT")
-    password = os.getenv("MT5_PASSWORD")
-
-    login = int(login_str) if login_str else 0
-
+def connect_mt5() -> float:
+    """Connects to MT5 and returns account balance."""
     try:
-        if path:
-            initialized = mt5.initialize(path=path)
-        else:
-            initialized = mt5.initialize()
-
-        if not initialized:
-            logger.error(f"Failed to initialize MT5: {mt5.last_error()}")
-            return False
-
-        if login and password and server:
-            authorized = mt5.login(login=login, password=password, server=server)
-            if not authorized:
-                logger.error(f"Failed to connect to MT5 account {login}: {mt5.last_error()}")
-                return False
+        load_dotenv()
+        login_str = os.getenv("MT5_LOGIN") or os.getenv("MT5_ACCOUNT")
+        password = os.getenv("MT5_PASSWORD")
+        server = os.getenv("MT5_SERVER")
+        
+        if not (login_str and password and server):
+            raise ConnectionError("Missing MT5 credentials in .env")
             
-        logger.info(f"Successfully connected to MT5 account {login}")
-        return True
+        login = int(login_str)
+        
+        if not mt5.initialize(login=login, password=password, server=server):
+            raise ConnectionError(f"MT5 initialization failed: {mt5.last_error()}")
+            
+        account_info = mt5.account_info()
+        if account_info is None:
+            raise ConnectionError(f"Failed to get account info: {mt5.last_error()}")
+            
+        balance = float(account_info.balance)
+        logger.info(f"Connected | Account: {login} | Balance: {balance}")
+        
+        return balance
+        
     except Exception as e:
-        logger.error(f"Exception during MT5 connection: {str(e)}")
-        return False
+        logger.error(f"Error connecting to MT5: {str(e)}")
+        raise
 
-def disconnect_mt5() -> None:
-    """
-    Disconnects from the MetaTrader 5 terminal.
-    """
+def get_ohlcv(symbol: str, timeframe_str: str, bars: int) -> pd.DataFrame:
+    """Fetches historical OHLCV data."""
     try:
-        mt5.shutdown()
-        logger.info("Disconnected from MT5")
-    except Exception as e:
-        logger.error(f"Exception during MT5 shutdown: {str(e)}")
-
-def get_historical_data(symbol: str, timeframe: int, num_candles: int) -> Optional[pd.DataFrame]:
-    """
-    Fetches historical OHLCV data from MT5.
-
-    Args:
-        symbol (str): The trading symbol.
-        timeframe (int): The MT5 timeframe constant.
-        num_candles (int): The number of candles to fetch.
-
-    Returns:
-        Optional[pd.DataFrame]: DataFrame with historical data or None on failure.
-    """
-    try:
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, num_candles)
+        timeframe_map = {
+            "M15": mt5.TIMEFRAME_M15,
+            "H1": mt5.TIMEFRAME_H1
+        }
+        
+        if timeframe_str not in timeframe_map:
+            raise ValueError(f"Unsupported timeframe: {timeframe_str}")
+            
+        timeframe = timeframe_map[timeframe_str]
+        
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
         if rates is None or len(rates) == 0:
-            logger.error(f"Failed to fetch historical data for {symbol}: {mt5.last_error()}")
-            return None
-
+            logger.error(f"Failed to fetch rates for {symbol}: {mt5.last_error()}")
+            return pd.DataFrame()
+            
         df = pd.DataFrame(rates)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
+        
+        # Convert time to datetime and make timezone-aware UTC
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
         df.set_index('time', inplace=True)
-        logger.info(f"Fetched {len(df)} historical candles for {symbol}")
+        
+        # Keep open, high, low, close, volume (mapped from tick_volume)
+        if 'tick_volume' in df.columns:
+            df.rename(columns={'tick_volume': 'volume'}, inplace=True)
+            
+        columns_to_keep = ['open', 'high', 'low', 'close', 'volume']
+        # Filter only existing columns just in case
+        columns_to_keep = [c for c in columns_to_keep if c in df.columns]
+        df = df[columns_to_keep]
+        
+        # Drop rows with NaN or zero volume
+        df.dropna(inplace=True)
+        if 'volume' in df.columns:
+            df = df[df['volume'] > 0]
+            
+        logger.info(f"Fetched {len(df)} bars for {symbol} on {timeframe_str}")
         return df
-
+        
     except Exception as e:
-        logger.error(f"Exception during historical data fetch for {symbol}: {str(e)}")
-        return None
+        logger.error(f"Error fetching OHLCV data: {str(e)}")
+        raise
 
-def get_current_tick(symbol: str) -> Optional[Dict[str, float]]:
-    """
-    Gets the latest tick (bid/ask) for a given symbol.
-
-    Args:
-        symbol (str): The trading symbol.
-
-    Returns:
-        Optional[Dict[str, float]]: Dictionary with 'bid' and 'ask' prices, or None on failure.
-    """
+def get_latest_tick(symbol: str) -> Dict[str, float]:
+    """Retrieves the latest tick and calculates spread in pips."""
     try:
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
-            logger.error(f"Failed to fetch tick for {symbol}: {mt5.last_error()}")
-            return None
-        
-        return {'bid': tick.bid, 'ask': tick.ask, 'time': float(tick.time)}
-    except Exception as e:
-        logger.error(f"Exception during tick fetch for {symbol}: {str(e)}")
-        return None
-
-def get_account_info() -> Optional[Dict[str, Any]]:
-    """
-    Retrieves current account information.
-
-    Returns:
-        Optional[Dict[str, Any]]: Account info dictionary or None on failure.
-    """
-    try:
-        account_info = mt5.account_info()
-        if account_info is None:
-            logger.error(f"Failed to get account info: {mt5.last_error()}")
-            return None
+            raise ValueError(f"Failed to fetch tick for {symbol}: {mt5.last_error()}")
             
-        return account_info._asdict()
+        ask = float(tick.ask)
+        bid = float(tick.bid)
+        spread_pips = (ask - bid) / 0.00001
+        
+        logger.info(f"Fetched tick for {symbol}: Bid={bid}, Ask={ask}, Spread(pips)={spread_pips:.1f}")
+        return {
+            "ask": ask,
+            "bid": bid,
+            "spread": spread_pips
+        }
+        
     except Exception as e:
-        logger.error(f"Exception fetching account info: {str(e)}")
-        return None
+        logger.error(f"Error fetching latest tick: {str(e)}")
+        raise
+
+def get_account_info() -> Dict[str, float]:
+    """Retrieves account information including calculated drawdown percentage."""
+    try:
+        info = mt5.account_info()
+        if info is None:
+            raise ValueError(f"Failed to fetch account info: {mt5.last_error()}")
+            
+        balance = float(info.balance)
+        equity = float(info.equity)
+        margin = float(info.margin)
+        free_margin = float(info.margin_free)
+        
+        drawdown_pct = ((balance - equity) / balance * 100.0) if balance > 0 else 0.0
+        
+        logger.info(f"Account Info: Balance={balance}, Equity={equity}, Drawdown={drawdown_pct:.2f}%")
+        return {
+            "balance": balance,
+            "equity": equity,
+            "margin": margin,
+            "free_margin": free_margin,
+            "drawdown_pct": drawdown_pct
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching account info: {str(e)}")
+        raise
+
+def save_data(df: pd.DataFrame, filename: str) -> None:
+    """Saves DataFrame to data directory."""
+    try:
+        os.makedirs("data", exist_ok=True)
+        filepath = os.path.join("data", f"{filename}.csv")
+        df.to_csv(filepath)
+        logger.info(f"Saved data to {filepath}")
+    except Exception as e:
+        logger.error(f"Error saving data to {filename}: {str(e)}")
+        raise
+
+def load_data(filename: str) -> pd.DataFrame:
+    """Loads DataFrame from data directory."""
+    try:
+        filepath = os.path.join("data", f"{filename}.csv")
+        df = pd.read_csv(filepath, index_col='time', parse_dates=True)
+        # Ensure it's timezone-aware UTC if not already
+        if df.index.tz is None:
+            df.index = df.index.tz_localize('UTC')
+        else:
+            df.index = df.index.tz_convert('UTC')
+            
+        logger.info(f"Loaded {len(df)} rows from {filepath}")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading data from {filename}: {str(e)}")
+        raise

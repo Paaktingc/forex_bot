@@ -1,42 +1,154 @@
-"""
-test_news_filter.py
-
-Unit tests for the news_filter.py module.
-"""
-
 import pytest
-from datetime import datetime, timedelta
-import sys
-from pathlib import Path
+import os
+import json
+from datetime import datetime, timezone, timedelta
+from unittest.mock import patch, MagicMock
+import pandas as pd
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-from news_filter import fetch_high_impact_news, is_trading_allowed_by_news
 import config
+from news_filter import (
+    _parse_ff_html,
+    fetch_forex_factory_calendar,
+    is_news_window,
+    get_next_news_event,
+    is_rollover_window,
+    CACHE_FILE
+)
 
-def test_fetch_high_impact_news():
-    now = datetime.utcnow()
-    news = fetch_high_impact_news(now)
-    assert isinstance(news, list)
+MOCK_HTML = """
+<html>
+<body>
+    <table class="calendar__table">
+        <tr class="calendar__row">
+            <td class="calendar__date">Mon Sep 25</td>
+            <td class="calendar__time">10:30am</td>
+            <td class="impact"><span class="icon--ff-impact-red"></span></td>
+            <td class="currency">EUR</td>
+            <td class="event">ECB President Lagarde Speaks</td>
+        </tr>
+        <tr class="calendar__row">
+            <td class="calendar__date"></td>
+            <td class="calendar__time">10:45am</td>
+            <td class="impact"><span class="icon--ff-impact-yel" title="Low Impact Expected"></span></td>
+            <td class="currency">USD</td>
+            <td class="event">Minor Economic Data</td>
+        </tr>
+    </table>
+</body>
+</html>
+"""
 
-def test_is_trading_allowed_by_news():
-    news_time = datetime(2023, 1, 1, 13, 30)
+@pytest.fixture(autouse=True)
+def clean_cache():
+    if os.path.exists(CACHE_FILE):
+        os.remove(CACHE_FILE)
+    yield
+    if os.path.exists(CACHE_FILE):
+        os.remove(CACHE_FILE)
+
+def test_parse_ff_html():
+    df = _parse_ff_html(MOCK_HTML)
+    assert len(df) == 1
+    assert df.loc[0, 'currency'] == 'EUR'
+    assert df.loc[0, 'event'] == 'ECB President Lagarde Speaks'
+    assert isinstance(df.loc[0, 'datetime_utc'], datetime)
+
+@patch('requests.get')
+def test_fetch_forex_factory_calendar_creates_cache(mock_get):
+    mock_res = MagicMock()
+    mock_res.text = MOCK_HTML
+    mock_res.raise_for_status.return_value = None
+    mock_get.return_value = mock_res
     
-    # 31 mins before - Allowed
-    current_time_before = news_time - timedelta(minutes=31)
-    assert is_trading_allowed_by_news(current_time_before, [news_time]) == True
+    assert not os.path.exists(CACHE_FILE)
+    df = fetch_forex_factory_calendar()
+    assert len(df) == 1
+    assert os.path.exists(CACHE_FILE)
     
-    # 29 mins before - Blocked
-    current_time_blocked_before = news_time - timedelta(minutes=29)
-    assert is_trading_allowed_by_news(current_time_blocked_before, [news_time]) == False
+    # Second call should use cache (requests.get not called again)
+    mock_get.reset_mock()
+    df2 = fetch_forex_factory_calendar()
+    mock_get.assert_not_called()
+    assert len(df2) == 1
+
+@patch('requests.get')
+def test_is_news_window_scraping_fails_blocks_trading(mock_get):
+    mock_get.side_effect = Exception("Connection error")
     
-    # Exactly on news time - Blocked
-    assert is_trading_allowed_by_news(news_time, [news_time]) == False
+    # Should block trading (fail closed) => returns True
+    assert is_news_window("EURUSD", 30) == True
+
+@patch('news_filter.fetch_forex_factory_calendar')
+def test_is_news_window(mock_fetch, monkeypatch):
+    # Mock current time to 10:45 UTC
+    now = datetime(2023, 9, 25, 10, 45, tzinfo=timezone.utc)
     
-    # 29 mins after - Blocked
-    current_time_blocked_after = news_time + timedelta(minutes=29)
-    assert is_trading_allowed_by_news(current_time_blocked_after, [news_time]) == False
+    class MockDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            return now
+            
+    monkeypatch.setattr('news_filter.datetime', MockDatetime)
     
-    # 31 mins after - Allowed
-    current_time_after = news_time + timedelta(minutes=31)
-    assert is_trading_allowed_by_news(current_time_after, [news_time]) == True
+    # News at 10:30 UTC
+    df = pd.DataFrame([{
+        'datetime_utc': datetime(2023, 9, 25, 10, 30, tzinfo=timezone.utc),
+        'currency': 'EUR',
+        'event': 'ECB Speaks'
+    }])
+    mock_fetch.return_value = df
+    
+    # 10:45 is within 30 mins of 10:30
+    assert is_news_window("EURUSD", 30) == True
+    
+    # GBPUSD -> should not be affected by EUR news
+    assert is_news_window("GBPUSD", 30) == False
+    
+    # 10:45 is outside 10 mins of 10:30
+    assert is_news_window("EURUSD", 10) == False
+
+@patch('news_filter.fetch_forex_factory_calendar')
+def test_get_next_news_event(mock_fetch, monkeypatch):
+    now = datetime(2023, 9, 25, 10, 0, tzinfo=timezone.utc)
+    class MockDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            return now
+    monkeypatch.setattr('news_filter.datetime', MockDatetime)
+    
+    df = pd.DataFrame([
+        {
+            'datetime_utc': datetime(2023, 9, 25, 11, 0, tzinfo=timezone.utc), # 60 mins away
+            'currency': 'EUR',
+            'event': 'ECB Speaks'
+        },
+        {
+            'datetime_utc': datetime(2023, 9, 25, 9, 0, tzinfo=timezone.utc), # Past event
+            'currency': 'USD',
+            'event': 'Old News'
+        }
+    ])
+    mock_fetch.return_value = df
+    
+    nxt = get_next_news_event("EURUSD")
+    assert nxt is not None
+    assert nxt['currency'] == 'EUR'
+    assert nxt['minutes_until'] == 60
+    assert nxt['event_name'] == 'ECB Speaks'
+
+def test_is_rollover_window(monkeypatch):
+    class MockDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2023, 9, 25, config.ROLLOVER_START_UTC, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr('news_filter.datetime', MockDatetime)
+    
+    assert is_rollover_window() == True
+    
+    class MockDatetimeFalse:
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2023, 9, 25, 12, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr('news_filter.datetime', MockDatetimeFalse)
+    
+    assert is_rollover_window() == False

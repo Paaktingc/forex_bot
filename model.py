@@ -1,155 +1,301 @@
 """
 model.py
 
-Implements Stage 1 (XGBoost) and Stage 2 (LSTM/Hybrid) modeling logic.
-Since the specified tech stack is XGBoost and Scikit-Learn, the XGBoost 
-classifier is fully implemented. The LSTM hybrid structure is scaffolded 
-ready for integration if a deep learning library (e.g., TensorFlow/PyTorch) is added.
+XGBoost classification model for forex signal prediction.
+Provides training with TimeSeriesSplit cross-validation,
+evaluation with per-class metrics, live signal prediction,
+model persistence, and a complete training pipeline.
 """
 
 import logging
-import pandas as pd
-import numpy as np
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
-import joblib
 import os
+import pickle
+import numpy as np
+import pandas as pd
+from typing import Tuple
+
+from xgboost import XGBClassifier
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    precision_recall_fscore_support,
+)
+from sklearn.preprocessing import LabelEncoder
+
 import config
 
 logger = logging.getLogger(__name__)
 
-class Stage1Model:
-    """Stage 1 XGBoost classification model."""
-    
-    def __init__(self):
-        # We use objective multi:softprob to output probabilities for 3 classes
-        self.model = xgb.XGBClassifier(
-            objective='multi:softprob',
-            num_class=3,
-            eval_metric='mlogloss',
-            use_label_encoder=False,
-            random_state=42,
-            n_estimators=100,
-            max_depth=5,
-            learning_rate=0.05
+
+# ─────────────────────────────────────────────────────────────
+# 1. train_model
+# ─────────────────────────────────────────────────────────────
+def train_model(X: pd.DataFrame, y: np.ndarray) -> XGBClassifier:
+    """
+    Trains an XGBClassifier using walk-forward TimeSeriesSplit (never shuffled).
+
+    Steps:
+        1. 5-fold time-series cross-validation with early stopping.
+        2. Prints classification_report per fold.
+        3. Retrains final model on the full dataset.
+        4. Saves model to config.MODEL_PATH.
+
+    Args:
+        X: Feature DataFrame (rows aligned with y).
+        y: Encoded target array.
+
+    Returns:
+        XGBClassifier: The final trained model.
+    """
+    n_classes = len(np.unique(y))
+
+    params = dict(
+        n_estimators=500,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
+        gamma=0.1,
+        eval_metric="mlogloss",
+        use_label_encoder=False,
+        random_state=42,
+        objective="multi:softprob",
+        num_class=n_classes,
+    )
+
+    tscv = TimeSeriesSplit(n_splits=5)
+
+    logger.info("Starting TimeSeriesSplit cross-validation (5 folds) ...")
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X), start=1):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y[train_idx], y[val_idx]
+
+        fold_model = XGBClassifier(**params)
+        fold_model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
         )
-        self.is_trained = False
-        self.features = []
 
-    def train(self, df: pd.DataFrame, target_col: str = 'target'):
-        """
-        Trains the XGBoost model.
-        
-        Args:
-            df (pd.DataFrame): Training data containing features and target.
-            target_col (str): Column name containing the target labels.
-        """
-        try:
-            if target_col not in df.columns:
-                raise ValueError(f"Target column '{target_col}' not found in DataFrame.")
-                
-            X = df.drop(columns=[target_col])
-            # Drop unnecessary or non-numeric columns like time string if present
-            X = X.select_dtypes(include=[np.number])
-            y = df[target_col]
-            
-            self.features = list(X.columns)
-            
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-            
-            logger.info("Starting XGBoost training...")
-            self.model.fit(
-                X_train, y_train,
-                eval_set=[(X_test, y_test)],
-                verbose=False
+        y_pred = fold_model.predict(X_val)
+        report = classification_report(y_val, y_pred, zero_division=0)
+        logger.info(f"\n===== Fold {fold} =====\n{report}")
+        print(f"\n===== Fold {fold} =====")
+        print(report)
+
+    # Final model on full dataset (no eval_set / early stopping)
+    logger.info("Training final model on full dataset ...")
+    final_params = {k: v for k, v in params.items()
+                    if k != "eval_metric"}
+    final_model = XGBClassifier(**final_params, eval_metric="mlogloss")
+    final_model.fit(X, y, verbose=False)
+
+    # Persist
+    os.makedirs(os.path.dirname(config.MODEL_PATH), exist_ok=True)
+    with open(config.MODEL_PATH, "wb") as f:
+        pickle.dump(final_model, f)
+    logger.info(f"Model saved to {config.MODEL_PATH}")
+
+    return final_model
+
+
+# ─────────────────────────────────────────────────────────────
+# 2. evaluate_model
+# ─────────────────────────────────────────────────────────────
+def evaluate_model(
+    model: XGBClassifier,
+    X_test: pd.DataFrame,
+    y_test: np.ndarray,
+    le: LabelEncoder,
+) -> dict:
+    """
+    Evaluates the model on a held-out test set.
+
+    Prints a classification report and confusion matrix.
+    Logs a WARNING if the sell-class recall falls below 0.40.
+
+    Args:
+        model: Trained XGBClassifier.
+        X_test: Test features.
+        y_test: Encoded test labels.
+        le: LabelEncoder used during training.
+
+    Returns:
+        dict: Per-class accuracy, precision, recall, f1.
+    """
+    y_pred = model.predict(X_test)
+
+    target_names = [str(c) for c in le.classes_]
+    report = classification_report(
+        y_test, y_pred, target_names=target_names, zero_division=0
+    )
+    cm = confusion_matrix(y_test, y_pred)
+
+    logger.info(f"\n=== Evaluation Report ===\n{report}")
+    logger.info(f"Confusion Matrix:\n{cm}")
+    print("\n=== Evaluation Report ===")
+    print(report)
+    print("Confusion Matrix:")
+    print(cm)
+
+    acc = accuracy_score(y_test, y_pred)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_test, y_pred, zero_division=0
+    )
+
+    results: dict = {"accuracy": acc}
+    for i, cls in enumerate(le.classes_):
+        results[f"precision_{cls}"] = precision[i]
+        results[f"recall_{cls}"] = recall[i]
+        results[f"f1_{cls}"] = f1[i]
+
+    # Warn if sell-class recall is weak
+    sell_label = -1
+    if sell_label in le.classes_:
+        sell_idx = list(le.classes_).index(sell_label)
+        if recall[sell_idx] < 0.40:
+            logger.warning(
+                f"Sell class recall is {recall[sell_idx]:.2f} — below 0.40 threshold. "
+                "Model may under-predict sell signals."
             )
-            
-            self.is_trained = True
-            
-            # Log metrics
-            preds = self.model.predict(X_test)
-            acc = accuracy_score(y_test, preds)
-            logger.info(f"XGBoost training completed. Validation Accuracy: {acc:.4f}")
-            
-        except Exception as e:
-            logger.error(f"Error during Stage1Model training: {str(e)}")
 
-    def predict(self, df: pd.DataFrame) -> dict:
-        """
-        Predicts trading signals for the latest row(s) based on confidence thresholds.
-        
-        Args:
-            df (pd.DataFrame): Feature dataframe.
-            
-        Returns:
-            dict: Dictionary containing predicted 'signal' (1=Buy, 2=Sell, 0=None)
-                  and the 'confidence' level.
-        """
-        try:
-            if not self.is_trained:
-                logger.error("Model is not trained. Please load or train first.")
-                return {'signal': 0, 'confidence': 0.0}
-                
-            # Use only the specified features
-            X = df[self.features].copy()
-            # Predict probabilities for the last row (current situation)
-            latest_features = X.iloc[-1:]
-            
-            probs = self.model.predict_proba(latest_features)[0]
-            
-            # probs[0] = Hold/Loss, probs[1] = Buy, probs[2] = Sell
-            prob_buy = probs[1]
-            prob_sell = probs[2]
-            
-            if prob_buy >= config.CONFIDENCE_THRESHOLD and prob_buy > prob_sell:
-                return {'signal': 1, 'confidence': float(prob_buy)}
-            elif prob_sell >= config.CONFIDENCE_THRESHOLD and prob_sell > prob_buy:
-                return {'signal': 2, 'confidence': float(prob_sell)}
-                
-            return {'signal': 0, 'confidence': float(max(prob_buy, prob_sell))}
-            
-        except Exception as e:
-            logger.error(f"Error during Stage1Model prediction: {str(e)}")
-            return {'signal': 0, 'confidence': 0.0}
-
-    def save(self, filepath: str):
-        if not self.is_trained:
-            logger.error("Cannot save untaught model.")
-            return
-        try:
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            joblib.dump({'model': self.model, 'features': self.features}, filepath)
-            logger.info(f"Model saved to {filepath}")
-        except Exception as e:
-            logger.error(f"Error saving model: {str(e)}")
-
-    def load(self, filepath: str):
-        try:
-            data = joblib.load(filepath)
-            self.model = data['model']
-            self.features = data['features']
-            self.is_trained = True
-            logger.info(f"Model loaded from {filepath}")
-        except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
+    return results
 
 
-class Stage2HybridModel:
+# ─────────────────────────────────────────────────────────────
+# 3. predict_signal
+# ─────────────────────────────────────────────────────────────
+def predict_signal(
+    model: XGBClassifier,
+    le: LabelEncoder,
+    X_live: pd.DataFrame,
+) -> Tuple[int, float]:
     """
-    Stage 2 Hybrid Model (LSTM for temporal sequence extraction -> XGBoost).
-    This acts as a scaffold for when a deep learning library is integrated.
+    Predicts a trading signal from live feature data.
+
+    Args:
+        model: Trained XGBClassifier.
+        le: LabelEncoder mapping encoded → original labels.
+        X_live: Single-row (or last-row) feature DataFrame.
+
+    Returns:
+        (signal, confidence):
+            signal — original label (1 = buy, -1 = sell, 0 = hold)
+            confidence — maximum class probability
+            Returns (0, confidence) when confidence < MIN_CONFIDENCE.
     """
-    def __init__(self):
-        self.xgb_model = Stage1Model()
-        self.is_trained = False
-        logger.warning("Stage2HybridModel LSTM components require TensorFlow/PyTorch. XGBoost logic isolated.")
-        
-    def train(self, df: pd.DataFrame, target_col: str = 'target'):
-        # TODO: Implement LSTM sequence extraction feature mapping once TF/PyTorch is available
-        logger.info("Training hybrid sequence. Bypassing to XGBoost...")
-        self.xgb_model.train(df, target_col)
-        self.is_trained = True
-        
-    def predict(self, df: pd.DataFrame) -> dict:
-        return self.xgb_model.predict(df)
+    try:
+        proba = model.predict_proba(X_live)[0]
+        confidence = float(np.max(proba))
+        predicted_encoded = int(np.argmax(proba))
+        signal = int(le.inverse_transform([predicted_encoded])[0])
+
+        if confidence < config.MIN_CONFIDENCE:
+            return (0, confidence)
+
+        return (signal, confidence)
+
+    except Exception as e:
+        logger.error(f"Error during predict_signal: {e}")
+        return (0, 0.0)
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. load_model
+# ─────────────────────────────────────────────────────────────
+def load_model() -> Tuple[XGBClassifier, LabelEncoder]:
+    """
+    Loads model and label encoder from disk.
+
+    Returns:
+        (model, le): Trained XGBClassifier and fitted LabelEncoder.
+
+    Raises:
+        FileNotFoundError: If model or encoder files are missing.
+        AttributeError: If loaded model lacks predict_proba.
+    """
+    if not os.path.exists(config.MODEL_PATH):
+        raise FileNotFoundError(f"Model not found at {config.MODEL_PATH}")
+    if not os.path.exists(config.ENCODER_PATH):
+        raise FileNotFoundError(f"Encoder not found at {config.ENCODER_PATH}")
+
+    with open(config.MODEL_PATH, "rb") as f:
+        model = pickle.load(f)
+
+    with open(config.ENCODER_PATH, "rb") as f:
+        le = pickle.load(f)
+
+    if not hasattr(model, "predict_proba"):
+        raise AttributeError("Loaded model does not support predict_proba.")
+
+    logger.info("Model and LabelEncoder loaded successfully.")
+    return model, le
+
+
+# ─────────────────────────────────────────────────────────────
+# 5. run_training_pipeline
+# ─────────────────────────────────────────────────────────────
+def run_training_pipeline() -> None:
+    """
+    End-to-end training pipeline:
+        1. Loads data/X_train.csv and data/y_train.npy.
+        2. Trains via TimeSeriesSplit CV.
+        3. Evaluates on the last 20% of the data.
+        4. Prints a final performance summary.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    X_path = config.DATA_DIR / "X_train.csv"
+    y_path = config.DATA_DIR / "y_train.npy"
+
+    if not os.path.exists(X_path) or not os.path.exists(y_path):
+        logger.error(
+            f"Training data not found. Expected:\n  {X_path}\n  {y_path}\n"
+            "Run labelling.py first to generate prepared data."
+        )
+        return
+
+    logger.info("Loading training data ...")
+    X = pd.read_csv(X_path)
+    y = np.load(y_path)
+
+    if not os.path.exists(config.ENCODER_PATH):
+        logger.error(f"LabelEncoder not found at {config.ENCODER_PATH}")
+        return
+
+    with open(config.ENCODER_PATH, "rb") as f:
+        le = pickle.load(f)
+
+    logger.info(f"Data loaded — X shape: {X.shape}, y shape: {y.shape}")
+    logger.info(f"Classes: {le.classes_}")
+
+    # Train
+    model = train_model(X, y)
+
+    # Evaluate on last 20%
+    split = int(len(X) * 0.8)
+    X_test = X.iloc[split:]
+    y_test = y[split:]
+
+    results = evaluate_model(model, X_test, y_test, le)
+
+    print("\n" + "=" * 50)
+    print("FINAL PERFORMANCE SUMMARY")
+    print("=" * 50)
+    print(f"  Accuracy : {results['accuracy']:.4f}")
+    for cls in le.classes_:
+        print(f"  Class {cls:>3d}:")
+        print(f"    Precision : {results[f'precision_{cls}']:.4f}")
+        print(f"    Recall    : {results[f'recall_{cls}']:.4f}")
+        print(f"    F1        : {results[f'f1_{cls}']:.4f}")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    run_training_pipeline()
