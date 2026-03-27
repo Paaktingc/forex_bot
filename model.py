@@ -12,9 +12,16 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
-from typing import Tuple
+import sys
+from typing import Any, Tuple
 
-from xgboost import XGBClassifier
+try:
+    from xgboost import XGBClassifier as _PreferredClassifier
+    XGBOOST_AVAILABLE = True
+except Exception:
+    _PreferredClassifier = None
+    XGBOOST_AVAILABLE = False
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import (
     classification_report,
@@ -28,11 +35,40 @@ import config
 
 logger = logging.getLogger(__name__)
 
+ClassifierType = Any
+
+if sys.platform == "darwin":
+    XGBOOST_AVAILABLE = False
+
+
+def _make_classifier(n_classes: int) -> ClassifierType:
+    if XGBOOST_AVAILABLE:
+        return _PreferredClassifier(
+            n_estimators=500,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            min_child_weight=5,
+            gamma=0.1,
+            eval_metric="mlogloss",
+            use_label_encoder=False,
+            random_state=42,
+            objective="multi:softprob",
+            num_class=n_classes,
+        )
+
+    logger.warning("XGBoost unavailable. Falling back to DecisionTreeClassifier.")
+    return DecisionTreeClassifier(
+        max_depth=6,
+        random_state=42,
+    )
+
 
 # ─────────────────────────────────────────────────────────────
 # 1. train_model
 # ─────────────────────────────────────────────────────────────
-def train_model(X: pd.DataFrame, y: np.ndarray) -> XGBClassifier:
+def train_model(X: pd.DataFrame, y: np.ndarray) -> ClassifierType:
     """
     Trains an XGBClassifier using walk-forward TimeSeriesSplit (never shuffled).
 
@@ -51,21 +87,6 @@ def train_model(X: pd.DataFrame, y: np.ndarray) -> XGBClassifier:
     """
     n_classes = len(np.unique(y))
 
-    params = dict(
-        n_estimators=500,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=5,
-        gamma=0.1,
-        eval_metric="mlogloss",
-        use_label_encoder=False,
-        random_state=42,
-        objective="multi:softprob",
-        num_class=n_classes,
-    )
-
     tscv = TimeSeriesSplit(n_splits=5)
 
     logger.info("Starting TimeSeriesSplit cross-validation (5 folds) ...")
@@ -73,12 +94,11 @@ def train_model(X: pd.DataFrame, y: np.ndarray) -> XGBClassifier:
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
         y_tr, y_val = y[train_idx], y[val_idx]
 
-        fold_model = XGBClassifier(**params)
-        fold_model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
-        )
+        fold_model = _make_classifier(n_classes)
+        fit_kwargs = {}
+        if XGBOOST_AVAILABLE:
+            fit_kwargs = {"eval_set": [(X_val, y_val)], "verbose": False}
+        fold_model.fit(X_tr, y_tr, **fit_kwargs)
 
         y_pred = fold_model.predict(X_val)
         report = classification_report(y_val, y_pred, zero_division=0)
@@ -88,10 +108,9 @@ def train_model(X: pd.DataFrame, y: np.ndarray) -> XGBClassifier:
 
     # Final model on full dataset (no eval_set / early stopping)
     logger.info("Training final model on full dataset ...")
-    final_params = {k: v for k, v in params.items()
-                    if k != "eval_metric"}
-    final_model = XGBClassifier(**final_params, eval_metric="mlogloss")
-    final_model.fit(X, y, verbose=False)
+    final_model = _make_classifier(n_classes)
+    final_fit_kwargs = {"verbose": False} if XGBOOST_AVAILABLE else {}
+    final_model.fit(X, y, **final_fit_kwargs)
 
     # Persist
     os.makedirs(os.path.dirname(config.MODEL_PATH), exist_ok=True)
@@ -106,7 +125,7 @@ def train_model(X: pd.DataFrame, y: np.ndarray) -> XGBClassifier:
 # 2. evaluate_model
 # ─────────────────────────────────────────────────────────────
 def evaluate_model(
-    model: XGBClassifier,
+    model: ClassifierType,
     X_test: pd.DataFrame,
     y_test: np.ndarray,
     le: LabelEncoder,
@@ -169,7 +188,7 @@ def evaluate_model(
 # 3. predict_signal
 # ─────────────────────────────────────────────────────────────
 def predict_signal(
-    model: XGBClassifier,
+    model: ClassifierType,
     le: LabelEncoder,
     X_live: pd.DataFrame,
 ) -> Tuple[int, float]:
@@ -206,7 +225,7 @@ def predict_signal(
 # ─────────────────────────────────────────────────────────────
 # 4. load_model
 # ─────────────────────────────────────────────────────────────
-def load_model() -> Tuple[XGBClassifier, LabelEncoder]:
+def load_model() -> Tuple[ClassifierType, LabelEncoder]:
     """
     Loads model and label encoder from disk.
 
@@ -222,6 +241,14 @@ def load_model() -> Tuple[XGBClassifier, LabelEncoder]:
     if not os.path.exists(config.ENCODER_PATH):
         raise FileNotFoundError(f"Encoder not found at {config.ENCODER_PATH}")
 
+    if sys.platform == "darwin":
+        with open(config.MODEL_PATH, "rb") as f:
+            header = f.read(4096)
+        if b"xgboost" in header.lower():
+            raise RuntimeError(
+                "Saved XGBoost model is not supported in this Mac/dev environment."
+            )
+
     with open(config.MODEL_PATH, "rb") as f:
         model = pickle.load(f)
 
@@ -230,6 +257,10 @@ def load_model() -> Tuple[XGBClassifier, LabelEncoder]:
 
     if not hasattr(model, "predict_proba"):
         raise AttributeError("Loaded model does not support predict_proba.")
+    if sys.platform == "darwin" and model.__class__.__module__.startswith("xgboost"):
+        raise RuntimeError(
+            "Saved XGBoost model is not supported in this Mac/dev environment."
+        )
 
     logger.info("Model and LabelEncoder loaded successfully.")
     return model, le

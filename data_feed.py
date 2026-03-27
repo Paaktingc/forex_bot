@@ -5,9 +5,18 @@ data_feed.py
 import os
 import logging
 import pandas as pd
-import MetaTrader5 as mt5
 from typing import Dict, Any
 from dotenv import load_dotenv
+
+import config
+
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    mt5 = None
+    MT5_AVAILABLE = False
+    logging.warning("MetaTrader5 not available — Mac/dev mode")
 
 # Setup logging
 logging.basicConfig(
@@ -16,9 +25,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _require_mt5() -> None:
+    if not MT5_AVAILABLE:
+        raise RuntimeError(
+            "MT5 not available. Deploy to Windows VPS for live trading."
+        )
+
 def connect_mt5() -> float:
     """Connects to MT5 and returns account balance."""
     try:
+        _require_mt5()
         load_dotenv()
         login_str = os.getenv("MT5_LOGIN") or os.getenv("MT5_ACCOUNT")
         password = os.getenv("MT5_PASSWORD")
@@ -48,6 +65,7 @@ def connect_mt5() -> float:
 def get_ohlcv(symbol: str, timeframe_str: str, bars: int) -> pd.DataFrame:
     """Fetches historical OHLCV data."""
     try:
+        _require_mt5()
         timeframe_map = {
             "M15": mt5.TIMEFRAME_M15,
             "H1": mt5.TIMEFRAME_H1
@@ -90,9 +108,31 @@ def get_ohlcv(symbol: str, timeframe_str: str, bars: int) -> pd.DataFrame:
         logger.error(f"Error fetching OHLCV data: {str(e)}")
         raise
 
+def get_ohlcv_from_csv(symbol: str, timeframe_str: str) -> pd.DataFrame:
+    """Loads OHLCV data from project CSV files for offline/backtest use."""
+    filepath = config.DATA_DIR / f"{symbol}_{timeframe_str}_real.csv"
+    try:
+        df = pd.read_csv(filepath, index_col=0, parse_dates=True)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+
+        columns_to_keep = ["open", "high", "low", "close", "volume"]
+        if "tick_volume" in df.columns and "volume" not in df.columns:
+            df = df.rename(columns={"tick_volume": "volume"})
+        columns_to_keep = [c for c in columns_to_keep if c in df.columns]
+        df = df[columns_to_keep].dropna()
+        logger.info(f"Loaded {len(df)} CSV bars for {symbol} on {timeframe_str}")
+        return df
+    except Exception as e:
+        logger.error(f"Error loading OHLCV CSV data from {filepath}: {str(e)}")
+        raise
+
 def get_latest_tick(symbol: str) -> Dict[str, float]:
     """Retrieves the latest tick and calculates spread in pips."""
     try:
+        _require_mt5()
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             raise ValueError(f"Failed to fetch tick for {symbol}: {mt5.last_error()}")
@@ -115,6 +155,7 @@ def get_latest_tick(symbol: str) -> Dict[str, float]:
 def get_account_info() -> Dict[str, float]:
     """Retrieves account information including calculated drawdown percentage."""
     try:
+        _require_mt5()
         info = mt5.account_info()
         if info is None:
             raise ValueError(f"Failed to fetch account info: {mt5.last_error()}")

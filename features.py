@@ -8,8 +8,6 @@ session embeddings, and multi-timeframe trends.
 import logging
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
-import MetaTrader5 as mt5
 
 import config
 from data_feed import get_ohlcv
@@ -26,62 +24,87 @@ FEATURE_COLS = [
     'h1_trend'
 ]
 
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+def _rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
+    avg_gain = gains.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    avg_loss = losses.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    true_range = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+
+
+def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=df.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=df.index,
+    )
+
+    atr = _atr(df, length)
+    plus_di = 100.0 * plus_dm.ewm(alpha=1 / length, adjust=False, min_periods=length).mean() / atr
+    minus_di = 100.0 * minus_dm.ewm(alpha=1 / length, adjust=False, min_periods=length).mean() / atr
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100.0
+    return dx.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Computes technical indicators using pandas-ta.
+    Computes technical indicators using pandas/numpy only.
     """
     df_out = df.copy()
     
-    # pandas-ta requires 'volume' instead of 'tick_volume' for some indicators if needed
     if 'tick_volume' in df_out.columns and 'volume' not in df_out.columns:
         df_out['volume'] = df_out['tick_volume']
-        
-    # RSI(14)
-    df_out.ta.rsi(length=14, append=True)
-    df_out.rename(columns={'RSI_14': 'rsi_14'}, inplace=True)
-    
-    # MACD(12, 26, 9)
-    df_out.ta.macd(fast=12, slow=26, signal=9, append=True)
-    df_out.rename(columns={
-        'MACD_12_26_9': 'macd_line',
-        'MACDh_12_26_9': 'macd_hist',
-        'MACDs_12_26_9': 'macd_signal'
-    }, inplace=True)
-    
-    # EMA 20 and 50
-    df_out.ta.ema(length=20, append=True)
-    df_out.rename(columns={'EMA_20': 'ema_20'}, inplace=True)
-    
-    df_out.ta.ema(length=50, append=True)
-    df_out.rename(columns={'EMA_50': 'ema_50'}, inplace=True)
-    
-    # EMA Ratio
-    df_out['ema_ratio'] = df_out['ema_20'] / df_out['ema_50']
-    
-    # Bollinger Bands(20, 2)
-    df_out.ta.bbands(length=20, std=2, append=True)
-    
-    # Safely rename Bollinger Bands columns due to pandas-ta returning varied suffix
-    bb_lower_col = next(c for c in df_out.columns if c.startswith('BBL_20'))
-    bb_mid_col = next(c for c in df_out.columns if c.startswith('BBM_20'))
-    bb_upper_col = next(c for c in df_out.columns if c.startswith('BBU_20'))
-    
-    df_out.rename(columns={
-        bb_lower_col: 'bb_lower',
-        bb_mid_col: 'bb_mid',
-        bb_upper_col: 'bb_upper'
-    }, inplace=True)
-    
-    # Override bb_pct calculation: (close - bb_lower) / (bb_upper - bb_lower)
-    df_out['bb_pct'] = (df_out['close'] - df_out['bb_lower']) / (df_out['bb_upper'] - df_out['bb_lower'])
-    
-    # ATR(14)
-    df_out.ta.atr(length=14, append=True)
-    df_out.rename(columns={'ATRr_14': 'atr_14'}, inplace=True)
-    
-    # ADX(14)
-    df_out.ta.adx(length=14, append=True)
-    df_out.rename(columns={'ADX_14': 'adx_14'}, inplace=True)
+
+    close = df_out["close"]
+    df_out["rsi_14"] = _rsi(close, 14)
+
+    ema_fast = _ema(close, 12)
+    ema_slow = _ema(close, 26)
+    df_out["macd_line"] = ema_fast - ema_slow
+    df_out["macd_signal"] = df_out["macd_line"].ewm(
+        span=9, adjust=False, min_periods=9
+    ).mean()
+    df_out["macd_hist"] = df_out["macd_line"] - df_out["macd_signal"]
+
+    df_out["ema_20"] = _ema(close, 20)
+    df_out["ema_50"] = _ema(close, 50)
+    df_out["ema_ratio"] = df_out["ema_20"] / df_out["ema_50"]
+
+    bb_mid = close.rolling(window=20, min_periods=20).mean()
+    bb_std = close.rolling(window=20, min_periods=20).std(ddof=0)
+    df_out["bb_mid"] = bb_mid
+    df_out["bb_upper"] = bb_mid + 2 * bb_std
+    df_out["bb_lower"] = bb_mid - 2 * bb_std
+    band_width = (df_out["bb_upper"] - df_out["bb_lower"]).replace(0, np.nan)
+    df_out["bb_pct"] = (close - df_out["bb_lower"]) / band_width
+
+    df_out["atr_14"] = _atr(df_out, 14)
+    df_out["adx_14"] = _adx(df_out, 14)
     
     return df_out
 
@@ -117,11 +140,8 @@ def add_h1_trend(df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> pd.DataFrame:
     +1 if H1 close > H1 EMA50, else -1.
     """
     df_h1_out = df_h1.copy()
-    # Compute EMA(50) on H1 data
-    df_h1_out.ta.ema(length=50, append=True)
-    
-    # If EMA_50 column doesn't exist (too few bars), create it from close
-    if 'EMA_50' not in df_h1_out.columns:
+    df_h1_out["EMA_50"] = _ema(df_h1_out["close"], 50)
+    if df_h1_out["EMA_50"].isna().all():
         df_h1_out['EMA_50'] = df_h1_out['close']
     
     m15_reset = df_m15.reset_index()

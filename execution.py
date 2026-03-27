@@ -13,7 +13,13 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    mt5 = None
+    MT5_AVAILABLE = False
+    logging.warning("MetaTrader5 not available — Mac/dev mode")
 
 import config
 
@@ -23,6 +29,13 @@ UTC = timezone.utc
 
 # Module-level timestamp of the last order send (for 2 s throttle)
 _last_order_time: Optional[float] = None
+
+
+def _require_mt5() -> None:
+    if not MT5_AVAILABLE:
+        raise RuntimeError(
+            "MT5 not available. Deploy to Windows VPS for live trading."
+        )
 
 
 def _enforce_order_delay() -> None:
@@ -63,6 +76,7 @@ def place_order(
     Returns:
         dict with ticket, price, sl, tp, volume, time — or None on failure.
     """
+    _require_mt5()
     _enforce_order_delay()
 
     try:
@@ -144,6 +158,7 @@ def close_order(ticket: int) -> bool:
     Returns:
         True if closed successfully, False otherwise.
     """
+    _require_mt5()
     _enforce_order_delay()
 
     try:
@@ -217,6 +232,7 @@ def get_open_positions(symbol: Optional[str] = None) -> list[dict]:
         List of dicts: ticket, symbol, type, volume, open_price,
                        sl, tp, open_time, profit.
     """
+    _require_mt5()
     try:
         if symbol:
             raw = mt5.positions_get(symbol=symbol)
@@ -268,6 +284,7 @@ def check_min_duration(ticket: int) -> bool:
     Returns True if the position identified by *ticket* has been open for
     at least MIN_TRADE_DURATION seconds.
     """
+    _require_mt5()
     try:
         positions = mt5.positions_get(ticket=ticket)
         if not positions:

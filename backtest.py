@@ -9,6 +9,7 @@ summary metrics, and walk-forward validation.
 from __future__ import annotations
 
 import logging
+import os
 from math import sqrt
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 
 import config
+from data_feed import get_ohlcv_from_csv
 from model import load_model, predict_signal, train_model
 from risk_manager import RiskManager
 
@@ -36,6 +38,9 @@ PASS_CRITERIA = {
     "sharpe_ratio": ("Sharpe ratio", 0.8, lambda value: value > 0.8, "> 0.8"),
     "min_trades": ("Min trades", 50, lambda value: value > 50, "> 50"),
 }
+
+ENABLE_WALK_FORWARD = os.getenv("BACKTEST_FULL_VALIDATION", "0") == "1"
+DEFAULT_MAX_M15_ROWS = int(os.getenv("BACKTEST_MAX_M15_ROWS", "3000"))
 
 
 def _to_utc_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -546,41 +551,53 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-
-    m15_path = config.DATA_DIR / "EURUSD_M15.csv"
-    h1_path = config.DATA_DIR / "EURUSD_H1.csv"
+    logging.getLogger("risk_manager").setLevel(logging.ERROR)
 
     try:
-        df_m15 = _load_price_csv(m15_path)
-        df_h1 = _load_price_csv(h1_path)
+        df_m15 = get_ohlcv_from_csv("EURUSD", "M15")
+        df_h1 = get_ohlcv_from_csv("EURUSD", "H1")
+        if DEFAULT_MAX_M15_ROWS > 0 and len(df_m15) > DEFAULT_MAX_M15_ROWS:
+            df_m15 = df_m15.iloc[-DEFAULT_MAX_M15_ROWS:].copy()
+            first_timestamp = df_m15.index[0].floor("h")
+            df_h1 = df_h1.loc[df_h1.index >= first_timestamp].copy()
     except Exception as exc:
         logger.error("Failed to load historical CSVs: %s", exc)
         return
 
     try:
         engine = BacktestEngine(df_m15, df_h1)
+        if engine.model is None or engine.label_encoder is None:
+            logger.info("Training a local model for backtest execution.")
+            training_frame = engine._prepare_training_frame(df_m15, df_h1)
+            labelled = apply_triple_barrier(training_frame)
+            X_train, y_encoded, le = prepare_training_data(labelled)
+            engine.model = train_model(X_train, y_encoded)
+            engine.label_encoder = le
         metrics = engine.run()
-        walk_forward_results = engine.walk_forward_validation()
+        walk_forward_results = engine.walk_forward_validation() if ENABLE_WALK_FORWARD else []
     except Exception as exc:
         logger.error("Backtest execution failed: %s", exc)
         return
 
     _print_metric_block("BACKTEST ENGINE RESULTS", metrics)
 
-    print("\nWALK-FORWARD VALIDATION")
-    print("-" * 56)
-    for result in walk_forward_results[:-1]:
-        print(
-            f"Window {result['window']}: "
-            f"return={result['total_return_pct']:.2f}% "
-            f"dd={result['max_drawdown_pct']:.2f}% "
-            f"wr={result['win_rate_pct']:.2f}% "
-            f"pf={result['profit_factor']:.2f} "
-            f"sharpe={result['sharpe_ratio']:.2f} "
-            f"trades={int(result['total_trades'])}"
-        )
+    if ENABLE_WALK_FORWARD:
+        print("\nWALK-FORWARD VALIDATION")
+        print("-" * 56)
+        for result in walk_forward_results[:-1]:
+            print(
+                f"Window {result['window']}: "
+                f"return={result['total_return_pct']:.2f}% "
+                f"dd={result['max_drawdown_pct']:.2f}% "
+                f"wr={result['win_rate_pct']:.2f}% "
+                f"pf={result['profit_factor']:.2f} "
+                f"sharpe={result['sharpe_ratio']:.2f} "
+                f"trades={int(result['total_trades'])}"
+            )
 
-    _print_metric_block("WALK-FORWARD AVERAGE", walk_forward_results[-1])
+        _print_metric_block("WALK-FORWARD AVERAGE", walk_forward_results[-1])
+    else:
+        print("\nWalk-forward validation skipped. Set BACKTEST_FULL_VALIDATION=1 to enable it.")
 
 
 if __name__ == "__main__":

@@ -9,11 +9,17 @@ risk management, and order execution on an M15 cadence.
 import argparse
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
-import MetaTrader5 as mt5
-from xgboost import XGBClassifier
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    mt5 = None
+    MT5_AVAILABLE = False
+    logging.warning("MetaTrader5 not available — Mac/dev mode")
 from sklearn.preprocessing import LabelEncoder
 
 import config
@@ -48,7 +54,7 @@ SYMBOL = config.SYMBOL
 @dataclass
 class BotState:
     starting_balance: float
-    model: XGBClassifier
+    model: Any
     label_encoder: LabelEncoder
     risk: object  # RiskManager (imported lazily to avoid circular deps)
     is_running: bool = True
@@ -71,6 +77,11 @@ def initialize_bot(dry_run: bool = False) -> BotState:
     prints a startup banner, and returns BotState.
     """
     from risk_manager import RiskManager
+
+    if not MT5_AVAILABLE:
+        raise RuntimeError(
+            "Cannot run live bot without MT5. Use --dry-run with mock data, or deploy to Windows VPS."
+        )
 
     # 1. Connect to MT5 and obtain starting balance
     starting_balance = data_feed.connect_mt5()
@@ -256,3 +267,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
