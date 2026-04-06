@@ -43,8 +43,7 @@ def test_apply_triple_barrier_hits_upper(synthetic_data):
     
     result = apply_triple_barrier(synthetic_data)
     assert 'label' in result.columns
-    # With a time limit of 20, result drops the last 20 rows
-    assert len(result) == 30
+    assert len(result) == len(synthetic_data) - config.TRIPLE_BARRIER_TIME_LIMIT
     # For row 0, it should hit upper (1)
     assert result.loc[0, 'label'] == 1
 

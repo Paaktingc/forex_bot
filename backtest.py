@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from math import sqrt
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,7 @@ PIP_VALUE_PER_LOT = 10.0
 ANNUALIZATION_FACTOR = sqrt(252 * 24 * 4)
 
 PASS_CRITERIA = {
-    "total_return": ("Total return", 8.0, lambda value: value > 8.0, "> 8%"),
+    "total_return": ("Total return", 8.0, lambda value: 8.0 <= value <= 40.0, "8-40%"),
     "max_drawdown": ("Max drawdown", 4.0, lambda value: value < 4.0, "< 4%"),
     "win_rate": ("Win rate", 45.0, lambda value: value > 45.0, "> 45%"),
     "profit_factor": ("Profit factor", 1.3, lambda value: value > 1.3, "> 1.3"),
@@ -165,22 +166,56 @@ def _format_value(name: str, metrics: dict[str, Any]) -> str:
     return f"{value:.2f}"
 
 
-def _print_metric_block(title: str, metrics: dict[str, Any]) -> None:
-    print("\n" + "=" * 56)
-    print(title)
-    print("=" * 56)
-    print(f"Total Return %           : {metrics['total_return_pct']:.2f}%")
-    print(f"Max Drawdown %           : {metrics['max_drawdown_pct']:.2f}%")
-    print(f"Sharpe Ratio             : {metrics['sharpe_ratio']:.2f}")
-    print(f"Profit Factor            : {metrics['profit_factor']:.2f}")
-    print(f"Win Rate %               : {metrics['win_rate_pct']:.2f}%")
-    print(f"Total Trades             : {metrics['total_trades']}")
-    print(f"Avg Trade Duration Bars  : {metrics['avg_trade_duration_candles']:.2f}")
-    print("-" * 56)
-    for key, (label, _, _, target_text) in PASS_CRITERIA.items():
-        passed = metrics.get("pass_criteria", {}).get(key, False)
-        status = "PASS" if passed else "FAIL"
-        print(f"{'✅' if passed else '❌'} {label:<16} {status:<4} ({_format_value(key, metrics)} {target_text})")
+def _box_line(text: str) -> str:
+    return f"│ {text:<39}│"
+
+
+def _print_metric_block(
+    metrics: dict[str, Any],
+    *,
+    date_range: tuple[pd.Timestamp, pd.Timestamp],
+    total_bars: int,
+) -> None:
+    start, end = date_range
+    print("┌─────────────────────────────────────────┐")
+    print(_box_line("BACKTEST RESULTS"))
+    print("├─────────────────────────────────────────┤")
+    print(_box_line(f"Date Range:    {start}"))
+    print(_box_line(f"               {end}"))
+    print(_box_line(f"Total Bars:    {total_bars}"))
+    print(_box_line(f"Total Trades:  {metrics['total_trades']}"))
+    print(_box_line(""))
+    print(_box_line(f"Total Return:  {metrics['total_return_pct']:.2f}%   TARGET: 8-40%"))
+    print(_box_line(f"Max Drawdown:  {metrics['max_drawdown_pct']:.2f}%   TARGET: <4%"))
+    print(_box_line(f"Win Rate:      {metrics['win_rate_pct']:.2f}%   TARGET: >45%"))
+    print(_box_line(f"Profit Factor: {metrics['profit_factor']:.2f}    TARGET: >1.3"))
+    print(_box_line(f"Sharpe Ratio:  {metrics['sharpe_ratio']:.2f}    TARGET: >0.8"))
+    print(_box_line(f"Total Trades:  {metrics['total_trades']}       TARGET: >50"))
+    print(_box_line(""))
+    print(_box_line("PASS/FAIL per metric"))
+    for key, (label, _, _, _) in PASS_CRITERIA.items():
+        status = "PASS" if metrics.get("pass_criteria", {}).get(key, False) else "FAIL"
+        print(_box_line(f"{label}: {status}"))
+    print("└─────────────────────────────────────────┘")
+
+
+def _report_overall_status(metrics: dict[str, Any]) -> None:
+    failing = [name for name, passed in metrics.get("pass_criteria", {}).items() if not passed]
+    if not failing:
+        print("\n✅ READY FOR DEMO")
+        return
+
+    fixes = {
+        "total_return": "Reduce overfitting or improve signal realism before using this result.",
+        "max_drawdown": "Tighten risk sizing or exits to bring drawdown under control.",
+        "win_rate": "Retune the classifier and signal threshold to improve precision.",
+        "profit_factor": "Improve trade quality before proceeding to demo conditions.",
+        "sharpe_ratio": "Stabilize returns; inspect trade clustering and sizing.",
+        "min_trades": "Lower confidence or rebalance labels to increase signal frequency.",
+    }
+    print("\n❌ NOT READY")
+    for metric in failing:
+        print(f"- {PASS_CRITERIA[metric][0]}: {fixes[metric]}")
 
 
 class BacktestEngine:
@@ -195,6 +230,7 @@ class BacktestEngine:
         self._validate_inputs()
         self.risk_manager = RiskManager(self.starting_balance)
         self.news_events = self._load_news_events()
+        self.feature_frame = build_feature_matrix(self.df, self.df_h1)
         self.model = None
         self.label_encoder = None
         try:
@@ -263,17 +299,12 @@ class BacktestEngine:
             )
 
     def _build_feature_row(self, bar_idx: int) -> pd.Series | None:
-        current_time = self.df.index[bar_idx]
-        df_m15_slice = self.df.iloc[: bar_idx + 1].copy()
-        df_h1_slice = self.df_h1.loc[self.df_h1.index <= current_time].copy()
-        if df_h1_slice.empty:
+        if bar_idx <= 0:
             return None
-
-        feature_frame = build_feature_matrix(df_m15_slice, df_h1_slice)
-        if feature_frame.empty or current_time not in feature_frame.index:
+        signal_time = self.df.index[bar_idx - 1]
+        if self.feature_frame.empty or signal_time not in self.feature_frame.index:
             return None
-
-        return feature_frame.loc[current_time]
+        return self.feature_frame.loc[signal_time]
 
     def _trade_pnl_currency(self, signal: int, entry_price: float, exit_price: float, lot: float) -> float:
         price_move = exit_price - entry_price
@@ -290,7 +321,9 @@ class BacktestEngine:
         return "BE"
 
     def _open_trade(self, bar_idx: int, signal: int, confidence: float, atr: float) -> dict[str, Any] | None:
-        entry_price = round(float(self.df["close"].iloc[bar_idx]) + ENTRY_SPREAD, 5)
+        raw_open = float(self.df["open"].iloc[bar_idx])
+        entry_price = raw_open + ENTRY_SPREAD if signal == 1 else raw_open - ENTRY_SPREAD
+        entry_price = round(float(entry_price), 5)
         sl, tp = self.risk_manager.calculate_sl_tp(signal, entry_price, float(atr))
         lot = self.risk_manager.calculate_lot_size(self.balance, sl, entry_price, config.SYMBOL)
         if lot <= 0:
@@ -395,7 +428,7 @@ class BacktestEngine:
 
         open_trades: list[dict[str, Any]] = []
 
-        for bar_idx in range(100, len(self.df)):
+        for bar_idx in range(101, len(self.df)):
             feature_row = self._build_feature_row(bar_idx)
             current_time = self.df.index[bar_idx]
 
@@ -489,7 +522,10 @@ class BacktestEngine:
         results: list[dict[str, Any]] = []
         splitter = TimeSeriesSplit(n_splits=5)
 
-        for window, (train_idx, test_idx) in enumerate(splitter.split(self.df), start=1):
+        for window, (train_idx, raw_test_idx) in enumerate(splitter.split(self.df), start=1):
+            test_idx = raw_test_idx[1:]
+            if len(test_idx) == 0:
+                continue
             train_m15 = self.df.iloc[train_idx].copy()
             test_m15 = self.df.iloc[test_idx].copy()
 
@@ -502,6 +538,11 @@ class BacktestEngine:
 
             fold_metrics = _empty_metrics()
             fold_metrics["window"] = window
+            fold_metrics["train_start"] = str(train_m15.index[0])
+            fold_metrics["train_end"] = str(train_end)
+            fold_metrics["test_start"] = str(test_m15.index[0])
+            fold_metrics["test_end"] = str(test_end)
+            fold_metrics["gap_bars"] = int(test_idx[0] - train_idx[-1] - 1)
 
             try:
                 training_frame = self._prepare_training_frame(train_m15, train_h1)
@@ -516,7 +557,13 @@ class BacktestEngine:
                 if X_train.empty or len(np.unique(y_encoded)) < 2:
                     raise ValueError("insufficient class diversity for training")
 
-                fold_model = train_model(X_train, y_encoded)
+                fold_model = train_model(
+                    X_train,
+                    y_encoded,
+                    label_encoder=le,
+                    persist=False,
+                    verbose_reports=False,
+                )
                 fold_engine = BacktestEngine(test_m15, test_h1, starting_balance=self.starting_balance)
                 fold_engine.model = fold_model
                 fold_engine.label_encoder = le
@@ -571,7 +618,13 @@ def main() -> None:
             training_frame = engine._prepare_training_frame(df_m15, df_h1)
             labelled = apply_triple_barrier(training_frame)
             X_train, y_encoded, le = prepare_training_data(labelled)
-            engine.model = train_model(X_train, y_encoded)
+            engine.model = train_model(
+                X_train,
+                y_encoded,
+                label_encoder=le,
+                persist=False,
+                verbose_reports=False,
+            )
             engine.label_encoder = le
         metrics = engine.run()
         walk_forward_results = engine.walk_forward_validation() if ENABLE_WALK_FORWARD else []
@@ -579,7 +632,16 @@ def main() -> None:
         logger.error("Backtest execution failed: %s", exc)
         return
 
-    _print_metric_block("BACKTEST ENGINE RESULTS", metrics)
+    _print_metric_block(
+        metrics,
+        date_range=(df_m15.index[0], df_m15.index[-1]),
+        total_bars=len(df_m15),
+    )
+
+    if metrics["total_return_pct"] > 200.0:
+        print("\n⛔ STOPPED: Return exceeds 200% — likely lookahead bias")
+        print("Check: features built without future data, no label leakage")
+        sys.exit(1)
 
     if ENABLE_WALK_FORWARD:
         print("\nWALK-FORWARD VALIDATION")
@@ -595,9 +657,19 @@ def main() -> None:
                 f"trades={int(result['total_trades'])}"
             )
 
-        _print_metric_block("WALK-FORWARD AVERAGE", walk_forward_results[-1])
+        average = walk_forward_results[-1]
+        print(
+            f"Average : return={average['total_return_pct']:.2f}% "
+            f"dd={average['max_drawdown_pct']:.2f}% "
+            f"wr={average['win_rate_pct']:.2f}% "
+            f"pf={average['profit_factor']:.2f} "
+            f"sharpe={average['sharpe_ratio']:.2f} "
+            f"trades={int(average['total_trades'])}"
+        )
     else:
         print("\nWalk-forward validation skipped. Set BACKTEST_FULL_VALIDATION=1 to enable it.")
+
+    _report_overall_status(metrics)
 
 
 if __name__ == "__main__":

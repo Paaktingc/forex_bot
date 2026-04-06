@@ -1,8 +1,8 @@
 """
 features.py
 
-Feature engineering module. Uses pandas-ta to compute technical indicators,
-session embeddings, and multi-timeframe trends.
+Feature engineering module for technical indicators, session embeddings,
+and multi-timeframe trends.
 """
 
 import logging
@@ -14,11 +14,33 @@ from data_feed import get_ohlcv
 
 logger = logging.getLogger(__name__)
 
+H1_FEATURE_COLS = [
+    "atr_14",
+    "ema_20",
+    "ema_50",
+    "ema_200",
+    "ema_20_50_diff",
+    "close_ema20_diff",
+    "close_ema50_diff",
+    "rsi_14",
+    "adx_14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "bb_width",
+    "bb_pct",
+    "ret_1",
+    "ret_4",
+    "ret_24",
+    "vol_ratio",
+]
+
 FEATURE_COLS = [
     'rsi_14', 'macd_line', 'macd_signal', 'macd_hist',
     'ema_20', 'ema_50', 'ema_ratio',
     'bb_upper', 'bb_lower', 'bb_mid', 'bb_pct',
     'atr_14', 'adx_14',
+    'price_momentum', 'volatility_ratio', 'bb_position', 'macd_cross', 'rsi_extreme',
     'is_london', 'is_ny', 'is_overlap',
     'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
     'h1_trend'
@@ -71,6 +93,101 @@ def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100.0
     return dx.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
 
+
+def _validate_h1_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validate and normalise an H1 OHLCV frame.
+    """
+    if df is None or df.empty:
+        raise ValueError("Input DataFrame is empty.")
+
+    out = df.copy()
+    if "tick_volume" in out.columns and "volume" not in out.columns:
+        out["volume"] = out["tick_volume"]
+
+    required = ["open", "high", "low", "close", "volume"]
+    missing = [column for column in required if column not in out.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}")
+
+    if not isinstance(out.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame must use a DatetimeIndex.")
+
+    return out.sort_index()
+
+
+def _rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
+    avg_gain = gains.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    avg_loss = losses.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def feature_engineering_h1(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute H1 features using ONLY data at time ``t`` and earlier.
+
+    CAUSALITY AUDIT
+    - ``atr_14`` uses high/low/close up to and including bar ``t``
+    - ``ema_20`` / ``ema_50`` / ``ema_200`` use closes up to ``t``
+    - ``ema_20_50_diff`` is derived from current EMAs only
+    - ``close_ema20_diff`` / ``close_ema50_diff`` use ``close[t]`` only
+    - ``rsi_14`` uses closes up to ``t``
+    - ``adx_14`` uses high/low/close up to ``t``
+    - ``macd`` / ``macd_signal`` / ``macd_hist`` use closes up to ``t``
+    - ``bb_width`` / ``bb_pct`` use rolling windows ending at ``t``
+    - ``ret_1`` / ``ret_4`` / ``ret_24`` use trailing returns ending at ``t``
+    - ``vol_ratio`` uses trailing rolling volatility ending at ``t``
+
+    Forbidden and intentionally absent:
+    - forward returns such as ``close[t+1] / close[t]``
+    - centred rolling windows
+    - any feature derived from a target column
+    - any feature using ``open[t+1]``
+
+    The returned frame keeps OHLCV plus engineered features. Warmup rows with
+    incomplete indicators are dropped.
+    """
+    out = _validate_h1_frame(df)
+    close = out["close"]
+    atr = _atr(out, 14)
+    atr_safe = atr.replace(0, np.nan)
+
+    out["atr_14"] = atr
+    out["ema_20"] = close.ewm(span=20, adjust=False, min_periods=20).mean()
+    out["ema_50"] = close.ewm(span=50, adjust=False, min_periods=50).mean()
+    out["ema_200"] = close.ewm(span=200, adjust=False, min_periods=200).mean()
+    out["ema_20_50_diff"] = (out["ema_20"] - out["ema_50"]) / atr_safe
+    out["close_ema20_diff"] = (close - out["ema_20"]) / atr_safe
+    out["close_ema50_diff"] = (close - out["ema_50"]) / atr_safe
+    out["rsi_14"] = _rsi_wilder(close, 14)
+    out["adx_14"] = _adx(out, 14)
+
+    ema12 = close.ewm(span=12, adjust=False, min_periods=12).mean()
+    ema26 = close.ewm(span=26, adjust=False, min_periods=26).mean()
+    out["macd"] = ema12 - ema26
+    out["macd_signal"] = out["macd"].ewm(span=9, adjust=False, min_periods=9).mean()
+    out["macd_hist"] = out["macd"] - out["macd_signal"]
+
+    sma20 = close.rolling(20, min_periods=20).mean()
+    std20 = close.rolling(20, min_periods=20).std(ddof=0)
+    out["bb_width"] = (2.0 * std20) / sma20.replace(0, np.nan)
+    out["bb_pct"] = (close - (sma20 - 2.0 * std20)) / (4.0 * std20).replace(0, np.nan)
+
+    out["ret_1"] = close.pct_change(1)
+    out["ret_4"] = close.pct_change(4)
+    out["ret_24"] = close.pct_change(24)
+
+    short_vol = close.pct_change().rolling(5, min_periods=5).std()
+    long_vol = close.pct_change().rolling(20, min_periods=20).std().replace(0, np.nan)
+    out["vol_ratio"] = short_vol / long_vol
+
+    out = out.dropna(subset=H1_FEATURE_COLS).copy()
+    return out
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Computes technical indicators using pandas/numpy only.
@@ -105,6 +222,15 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df_out["atr_14"] = _atr(df_out, 14)
     df_out["adx_14"] = _adx(df_out, 14)
+    df_out["price_momentum"] = (close - close.shift(20)) / close.shift(20)
+    df_out["volatility_ratio"] = df_out["atr_14"] / close.rolling(50, min_periods=50).mean()
+    df_out["bb_position"] = (close - df_out["bb_lower"]) / band_width
+    df_out["macd_cross"] = (
+        (df_out["macd_hist"] > 0) & (df_out["macd_hist"].shift(1) <= 0)
+    ).astype(int)
+    df_out["rsi_extreme"] = (
+        (df_out["rsi_14"] < 30) | (df_out["rsi_14"] > 70)
+    ).astype(int)
     
     return df_out
 
@@ -124,6 +250,9 @@ def compute_session_features(df: pd.DataFrame) -> pd.DataFrame:
     # is_overlap: 1 if both london and ny active (13–16 UTC)
     # Using the specific prompt definition explicitly, or the intersection
     df_out['is_overlap'] = ((hours >= 13) & (hours <= 16)).astype(int)
+    df_out['is_london'] *= 0.5
+    df_out['is_ny'] *= 0.5
+    df_out['is_overlap'] *= 0.5
     
     # Cyclical hour and day of week
     df_out['hour_sin'] = np.sin(2 * np.pi * hours / 24.0)
@@ -147,11 +276,13 @@ def add_h1_trend(df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> pd.DataFrame:
     m15_reset = df_m15.reset_index()
     h1_reset = df_h1_out.reset_index()
     
-    # Ensure time columns exist
-    if 'time' not in m15_reset.columns and 'index' in m15_reset.columns:
-        m15_reset = m15_reset.rename(columns={'index': 'time'})
-    if 'time' not in h1_reset.columns and 'index' in h1_reset.columns:
-        h1_reset = h1_reset.rename(columns={'index': 'time'})
+    # Normalize reset-index datetime column names for merge_asof.
+    if 'time' not in m15_reset.columns:
+        first_col = m15_reset.columns[0]
+        m15_reset = m15_reset.rename(columns={first_col: 'time'})
+    if 'time' not in h1_reset.columns:
+        first_col = h1_reset.columns[0]
+        h1_reset = h1_reset.rename(columns={first_col: 'time'})
         
     merged = pd.merge_asof(
         m15_reset.sort_values('time'),

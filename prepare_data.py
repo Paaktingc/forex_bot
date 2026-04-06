@@ -22,10 +22,10 @@ MIN_M15_BARS = 35_000
 
 def find_raw_files() -> list[Path]:
     files = sorted(
-        file for file in RAW_DIR.rglob("*.csv") if "EURUSD" in file.name and "M1" in file.name
+        file for file in RAW_DIR.rglob("*.csv") if "EURUSD" in file.name
     )
     if not files:
-        raise FileNotFoundError(f"No raw EURUSD M1 CSV files found in {RAW_DIR}")
+        raise FileNotFoundError(f"No raw EURUSD CSV files found in {RAW_DIR}")
     return files
 
 
@@ -104,10 +104,9 @@ def run_pipeline() -> tuple[pd.DataFrame, pd.DataFrame]:
     validate_frame(df_m15, df_h1)
     save_outputs(df_m15, df_h1)
 
-    print(
-        f"M15 bars: {len(df_m15)} | H1 bars: {len(df_h1)} | "
-        f"Date range: {df_m15.index.min()} to {df_m15.index.max()}"
-    )
+    print(f"M15: {len(df_m15)} bars | H1: {len(df_h1)} bars | {df_m15.index.min()} → {df_m15.index.max()}")
+    print(f"Raw CSV files loaded: {len(find_raw_files())}")
+    print(f"Raw M1 rows merged: {len(df_m1)}")
     print(f"Saved: {M15_OUTPUT}")
     print(f"Saved: {H1_OUTPUT}")
     return df_m15, df_h1

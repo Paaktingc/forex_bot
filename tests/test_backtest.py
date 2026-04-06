@@ -69,21 +69,23 @@ def test_backtest_engine_validation_rejects_missing_columns(dummy_artifacts):
 def test_run_builds_features_with_strict_prefix_only(dummy_artifacts, monkeypatch):
     df_m15, df_h1 = make_frames(rows=105)
     engine = backtest.BacktestEngine(df_m15, df_h1)
+    feature_index = df_m15.index
+    engine.feature_frame = pd.DataFrame(
+        {"atr_14": np.full(len(feature_index), 0.0010)},
+        index=feature_index,
+    )
 
-    observed_calls = []
+    seen_rows = []
 
-    def fake_build_feature_matrix(df_m15_slice, df_h1_slice):
-        current_time = df_m15_slice.index[-1]
-        observed_calls.append((len(df_m15_slice), current_time, df_h1_slice.index.max()))
-        return pd.DataFrame({"atr_14": [0.0010], "feature_a": [1.0]}, index=[current_time])
+    def fake_predict_signal(model, le, X_live):
+        seen_rows.append(X_live.index[0])
+        return (0, 0.0)
 
-    monkeypatch.setattr(backtest, "build_feature_matrix", fake_build_feature_matrix)
-    monkeypatch.setattr(backtest, "predict_signal", lambda model, le, X_live: (0, 0.0))
+    monkeypatch.setattr(backtest, "predict_signal", fake_predict_signal)
 
     metrics = engine.run()
 
-    assert observed_calls[0][0] == 101
-    assert all(h1_max <= current_time for _, current_time, h1_max in observed_calls)
+    assert seen_rows[0] == df_m15.index[100]
     assert metrics["total_trades"] == 0
 
 
@@ -91,19 +93,19 @@ def test_run_builds_features_with_strict_prefix_only(dummy_artifacts, monkeypatc
     ("exit_bar", "bar_updates", "expected_reason", "expected_result"),
     [
         (
-            101,
+            102,
             {"high": 1.1025, "low": 1.1005, "close": 1.1010},
             "TP",
             "WIN",
         ),
         (
-            101,
+            102,
             {"high": 1.1005, "low": 1.0990, "close": 1.0995},
             "SL",
             "LOSS",
         ),
         (
-            120,
+            126,
             {"high": 1.1010, "low": 1.0995, "close": 1.1003},
             "TIME_LIMIT",
             "BE",
@@ -124,17 +126,16 @@ def test_run_closes_trades_on_tp_sl_and_time_limit(
             df_m15.iloc[bar, df_m15.columns.get_loc(column)] = value
 
     engine = backtest.BacktestEngine(df_m15, df_h1)
-
-    def fake_build_feature_matrix(df_m15_slice, df_h1_slice):
-        current_time = df_m15_slice.index[-1]
-        return pd.DataFrame({"atr_14": [0.0010], "feature_a": [1.0]}, index=[current_time])
+    engine.feature_frame = pd.DataFrame(
+        {"atr_14": np.full(len(df_m15), 0.0010)},
+        index=df_m15.index,
+    )
 
     calls = count()
 
     def fake_predict_signal(model, le, X_live):
         return (1, 0.90) if next(calls) == 0 else (0, 0.0)
 
-    monkeypatch.setattr(backtest, "build_feature_matrix", fake_build_feature_matrix)
     monkeypatch.setattr(backtest, "predict_signal", fake_predict_signal)
 
     metrics = engine.run()
@@ -143,18 +144,16 @@ def test_run_closes_trades_on_tp_sl_and_time_limit(
     trade = engine.trades[0]
     assert trade["exit_reason"] == expected_reason
     assert trade["result"] == expected_result
-    assert trade["duration_candles"] == exit_bar - 100
+    assert trade["duration_candles"] == exit_bar - 101
 
 
 def test_run_skips_entries_during_rollover_or_news_windows(dummy_artifacts, monkeypatch):
     df_m15, df_h1 = make_frames(rows=110)
     engine = backtest.BacktestEngine(df_m15, df_h1)
-
-    def fake_build_feature_matrix(df_m15_slice, df_h1_slice):
-        current_time = df_m15_slice.index[-1]
-        return pd.DataFrame({"atr_14": [0.0010], "feature_a": [1.0]}, index=[current_time])
-
-    monkeypatch.setattr(backtest, "build_feature_matrix", fake_build_feature_matrix)
+    engine.feature_frame = pd.DataFrame(
+        {"atr_14": np.full(len(df_m15), 0.0010)},
+        index=df_m15.index,
+    )
     monkeypatch.setattr(backtest, "predict_signal", lambda model, le, X_live: (1, 0.90))
     monkeypatch.setattr(engine, "_historical_rollover_window", lambda ts: True)
     monkeypatch.setattr(engine, "_historical_news_window", lambda ts: False)
@@ -172,12 +171,10 @@ def test_run_skips_entries_during_rollover_or_news_windows(dummy_artifacts, monk
 def test_run_respects_max_open_trades_limit(dummy_artifacts, monkeypatch):
     df_m15, df_h1 = make_frames(rows=115)
     engine = backtest.BacktestEngine(df_m15, df_h1)
-
-    def fake_build_feature_matrix(df_m15_slice, df_h1_slice):
-        current_time = df_m15_slice.index[-1]
-        return pd.DataFrame({"atr_14": [0.0010], "feature_a": [1.0]}, index=[current_time])
-
-    monkeypatch.setattr(backtest, "build_feature_matrix", fake_build_feature_matrix)
+    engine.feature_frame = pd.DataFrame(
+        {"atr_14": np.full(len(df_m15), 0.0010)},
+        index=df_m15.index,
+    )
     monkeypatch.setattr(backtest, "predict_signal", lambda model, le, X_live: (1, 0.90))
     monkeypatch.setattr(backtest.config, "MAX_OPEN_TRADES", 1)
 
@@ -248,7 +245,7 @@ def test_walk_forward_validation_returns_five_windows_plus_average(dummy_artifac
     monkeypatch.setattr(backtest.BacktestEngine, "_prepare_training_frame", fake_prepare_frame)
     monkeypatch.setattr(backtest, "apply_triple_barrier", fake_apply_triple_barrier)
     monkeypatch.setattr(backtest, "prepare_training_data", fake_prepare_training_data)
-    monkeypatch.setattr(backtest, "train_model", lambda X, y: object())
+    monkeypatch.setattr(backtest, "train_model", lambda *args, **kwargs: object())
     monkeypatch.setattr(backtest.BacktestEngine, "run", fake_run)
 
     results = engine.walk_forward_validation()

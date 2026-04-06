@@ -80,9 +80,9 @@ def test_compute_session_features(sample_m15):
         assert col in df_sess.columns, f"{col} missing in output"
         
     # Test valid range of values
-    assert df_sess['is_london'].isin([0, 1]).all()
-    assert df_sess['is_ny'].isin([0, 1]).all()
-    assert df_sess['is_overlap'].isin([0, 1]).all()
+    assert df_sess['is_london'].isin([0, 0.5]).all()
+    assert df_sess['is_ny'].isin([0, 0.5]).all()
+    assert df_sess['is_overlap'].isin([0, 0.5]).all()
 
 def test_add_h1_trend(sample_m15, sample_h1):
     df_trend = add_h1_trend(sample_m15, sample_h1)
