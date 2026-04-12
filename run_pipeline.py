@@ -1,28 +1,46 @@
 """
 run_pipeline.py
 
-Main pipeline. Runs two evaluation modes and compares:
-
-Mode A: Direct prediction (primary model predicts direction)
-Mode B: Meta-labeling (base signals filtered by meta-model)
+Change summary:
+- Switched the research pipeline from bar-wise directional prediction to
+  meta-labeling on raw rule-based candidate signals.
+- The run now evaluates raw base signals and meta-filtered signals across
+  multiple probability thresholds.
 """
 
 from __future__ import annotations
 
+import io
 import glob
 import os
 import time
+from contextlib import redirect_stdout
 from pathlib import Path
-from typing import List
 
 import pandas as pd
 
-from features import feature_engineering_h1
-from labelling import generate_directional_targets, regime_filter, verify_label_distribution
-from meta_labeling import generate_base_signals, label_signal_outcomes
+from features import META_FEATURE_COLS, feature_engineering_h1
+from feature_importance import FeatureImportancePipeline, PipelineConfig
+from labelling import generate_base_strategy_signals, label_base_signals_with_triple_barrier
+from regime_diagnostic import DiagnosticConfig, RegimeDiagnostic
 from report import generate_backtest_report
 from resampler import resample_ohlcv
-from validation import detect_lookahead_bias, walk_forward_meta_labeling, walk_forward_validation
+from validation import detect_lookahead_bias, walk_forward_meta_labeling
+
+PURGE_GAP = 10
+EMBARGO_GAP = 20
+THRESHOLDS = (0.50, 0.55, 0.60, 0.65)
+META_CONFIG = {
+    "tp_atr_mult": 1.5,
+    "forward_horizon": 10,
+    "target_vol": None,
+    "vol_scale_clamp": (0.25, 2.0),
+    "conf_scale_range": (0.5, 2.0),
+    "combined_scale_clamp": (0.2, 3.0),
+    "adaptive_sl_threshold": 0.60,
+    "tight_sl_mult": 0.8,
+    "standard_sl_mult": 1.0,
+}
 
 
 def _parse_histdata_no_header(csv_path: str) -> pd.DataFrame:
@@ -110,111 +128,96 @@ def load_data(data_dir: str = ".") -> pd.DataFrame:
         df = pd.concat(frames).sort_index()
         df = df[~df.index.duplicated(keep="last")]
         diffs = df.index.to_series().diff().dropna()
-        median_diff = diffs.median()
-        print(f"Detected bar interval: {median_diff}")
+        print(f"Detected bar interval: {diffs.median()}")
         print(f"Total bars loaded: {len(df)}")
         print(f"Date range: {df.index.min()} → {df.index.max()}")
         return df
 
-    patterns = [
-        str(base_dir / "*.csv"),
-        str(base_dir / "data" / "*.csv"),
-    ]
+    patterns = [str(base_dir / "*.csv"), str(base_dir / "data" / "*.csv")]
     csv_files: list[str] = []
     for pattern in patterns:
         csv_files.extend(glob.glob(pattern, recursive=True))
 
-    csv_files = sorted(
-        {
-            path
-            for path in csv_files
-            if "EURUSD" in Path(path).name.upper() and "FEATURES" not in Path(path).name.upper()
-        }
-    )
+    csv_files = sorted({path for path in csv_files if "EURUSD" in Path(path).name.upper()})
     if not csv_files:
-        raise FileNotFoundError(
-            f"No CSV files found under {base_dir}. Place your EURUSD OHLCV CSV there."
-        )
+        raise FileNotFoundError(f"No EURUSD CSV files found under {base_dir}")
 
     csv_path = max(csv_files, key=os.path.getsize)
     print(f"Loading: {csv_path}")
-
     try:
         df = _parse_histdata_no_header(csv_path)
     except Exception:
         df = _parse_standard_csv(csv_path)
-
     diffs = df.index.to_series().diff().dropna()
-    median_diff = diffs.median()
-    print(f"Detected bar interval: {median_diff}")
+    print(f"Detected bar interval: {diffs.median()}")
     print(f"Total bars loaded: {len(df)}")
     print(f"Date range: {df.index.min()} → {df.index.max()}")
     return df
 
 
-def run_mode_a_direct_prediction(df_h1: pd.DataFrame, feature_cols: List[str], label_col: str) -> dict:
-    print("\n" + "=" * 60)
-    print("MODE A: DIRECT PREDICTION (trade-return targets)")
-    print("=" * 60)
-    return walk_forward_validation(
-        df_h1,
-        feature_cols,
-        label_col=label_col,
-        train_months=6,
-        test_months=1,
-        purge_bars=24,
-        embargo_bars=12,
-        risk_per_trade=0.01,
-        tp_atr_mult=1.5,
-        sl_atr_mult=1.0,
+def _attach_signal_metadata(df_h1: pd.DataFrame, signals: pd.DataFrame) -> pd.DataFrame:
+    out = df_h1.copy()
+    out["base_signal"] = 0
+    out["direction_code"] = 0
+    out["reason_code"] = ""
+    out["reason_sma_cross"] = 0
+    out["reason_breakout"] = 0
+    out["barrier_label"] = pd.NA
+    out["outcome_binary"] = pd.NA
+    out["realized_r"] = pd.NA
+
+    if signals.empty:
+        return out
+
+    aligned_index = out.index.intersection(signals.index)
+    signal_slice = signals.loc[aligned_index]
+    out.loc[aligned_index, "base_signal"] = signal_slice["signal"].astype(int)
+    out.loc[aligned_index, "direction_code"] = signal_slice["signal"].astype(int)
+    out.loc[aligned_index, "reason_code"] = signal_slice["reason_code"].astype(str)
+    out.loc[aligned_index, "reason_sma_cross"] = signal_slice["reason_code"].str.contains("sma_cross").astype(int)
+    out.loc[aligned_index, "reason_breakout"] = signal_slice["reason_code"].str.contains("breakout").astype(int)
+    out.loc[aligned_index, "barrier_label"] = signal_slice["barrier_label"].astype(int)
+    out.loc[aligned_index, "outcome_binary"] = signal_slice["outcome_binary"]
+    out.loc[aligned_index, "realized_r"] = signal_slice["realized_r"].astype(float)
+    return out
+
+
+def _capture_output(func, *args, **kwargs) -> str:
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        func(*args, **kwargs)
+    output = buffer.getvalue().strip()
+    if output:
+        print(output)
+    return output
+
+
+def _build_augmented_feature_frame(df_meta: pd.DataFrame, diagnostic_frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    augmented = df_meta.copy()
+    aligned = diagnostic_frame.reindex(augmented.index)
+
+    regime_numeric = ["realised_vol", "trend_strength"]
+    regime_categorical = ["vol_regime", "trend_regime", "trend_dir", "session", "dow"]
+
+    for column in regime_numeric:
+        augmented[column] = aligned[column]
+
+    encoded = pd.get_dummies(
+        aligned[regime_categorical].fillna("N/A"),
+        prefix=["regime_vol", "regime_trend", "regime_dir", "regime_session", "regime_dow"],
+        dtype=int,
     )
+    augmented = augmented.join(encoded)
 
-
-def run_mode_b_meta_labeling(df_h1: pd.DataFrame, feature_cols: List[str]) -> dict | None:
-    print("\n" + "=" * 60)
-    print("MODE B: META-LABELING (base signal + meta filter)")
-    print("=" * 60)
-
-    signals = generate_base_signals(df_h1)
-    signal_count = int((signals != 0).sum())
-    print(f"Base signals generated: {signal_count} ({signal_count / len(df_h1) * 100:.1f}% of bars)")
-
-    outcomes = label_signal_outcomes(
-        df_h1,
-        signals,
-        tp_atr_mult=1.5,
-        sl_atr_mult=1.0,
-        max_holding_bars=24,
+    candidate_cols = list(
+        dict.fromkeys(
+            list(META_FEATURE_COLS)
+            + ["direction_code", "reason_sma_cross", "reason_breakout"]
+            + regime_numeric
+            + list(encoded.columns)
+        )
     )
-    valid = outcomes.dropna()
-    if len(valid) == 0:
-        print("WARNING: No valid signal outcomes. Check data.")
-        return None
-
-    print(f"Base strategy win rate (no filter): {valid.mean():.1%}")
-    return walk_forward_meta_labeling(
-        df_h1,
-        feature_cols,
-        signals,
-        outcomes,
-        train_months=6,
-        test_months=1,
-        purge_bars=24,
-        embargo_bars=12,
-        risk_per_trade=0.01,
-        confidence_threshold=0.55,
-    )
-
-
-def _parse_checks_passed(value: object) -> int:
-    if isinstance(value, str) and "/" in value:
-        try:
-            return int(value.split("/", 1)[0])
-        except ValueError:
-            return 0
-    if isinstance(value, int):
-        return value
-    return 0
+    return augmented, candidate_cols
 
 
 def main() -> None:
@@ -230,108 +233,144 @@ def main() -> None:
     else:
         df_h1_raw = resample_ohlcv(raw, target_tf="1h")
     print(f"H1 bars: {len(df_h1_raw)}")
-    if len(df_h1_raw) < 2000:
-        print("WARNING: < 2000 H1 bars. Need 2+ years for reliable walk-forward validation.")
 
-    print("\nSTEP 3: Engineering features (causally clean)...")
+    print("\nSTEP 3: Engineering signal-time features...")
     df_h1 = feature_engineering_h1(df_h1_raw)
-    print(f"Features computed. Bars after warmup: {len(df_h1)}")
+    print(f"Feature rows after warmup: {len(df_h1)}")
 
-    df_h1["regime"] = regime_filter(df_h1_raw).reindex(df_h1.index).fillna(0).astype(int)
-    regime_dist = verify_label_distribution(df_h1["regime"])
-    print(f"Regime feature distribution: {regime_dist}")
-    if not regime_dist["healthy"]:
-        print(f"WARNING: Unhealthy regime distribution: {regime_dist['diagnosis']}")
+    print("\nSTEP 4: Generating raw base signals...")
+    signals = generate_base_strategy_signals(df_h1)
+    print(f"Candidate signals: {len(signals)}")
+    if not signals.empty:
+        print(signals["reason_code"].value_counts().to_string())
 
-    feature_cols = [
-        column
-        for column in df_h1.columns
-        if column not in ["open", "high", "low", "close", "volume", "target_long", "target_short", "target_best"]
-    ]
-    print(f"Feature columns ({len(feature_cols)}): {feature_cols[:8]}{'...' if len(feature_cols) > 8 else ''}")
+    print("\nSTEP 5: Labeling signals with Triple Barrier...")
+    labelled_signals = label_base_signals_with_triple_barrier(df_h1, signals)
+    print(f"Signals with barrier labels: {len(labelled_signals)}")
+    if not labelled_signals.empty:
+        label_counts = labelled_signals["barrier_label"].value_counts(dropna=False).sort_index()
+        print("Barrier outcome distribution:")
+        for label_value, count in label_counts.items():
+            print(f"  {label_value}: {count}")
 
-    print("\nSTEP 4: Generating trade-return targets...")
-    targets = generate_directional_targets(
-        df_h1,
-        tp_atr_mult=1.5,
-        sl_atr_mult=1.0,
-        max_holding_bars=24,
+    print("\nSTEP 6: Building meta-label dataset...")
+    df_meta = _attach_signal_metadata(df_h1, labelled_signals)
+    signal_rows = int((df_meta["base_signal"] != 0).sum())
+    non_timeout_rows = int(((df_meta["base_signal"] != 0) & df_meta["outcome_binary"].notna()).sum())
+    print(f"Signal rows available: {signal_rows}")
+    print(f"Training rows after filtering TIMEOUT: {non_timeout_rows}")
+
+    print("\nSTEP 7: Running regime diagnostic...")
+    df_diag = df_meta.copy()
+    df_diag["signal"] = df_diag["base_signal"].astype(int)
+    df_diag["outcome"] = pd.to_numeric(df_diag["barrier_label"], errors="coerce").fillna(0).astype(int)
+    regime_diag = RegimeDiagnostic(
+        df_diag,
+        signal_col="signal",
+        price_col="close",
+        outcome_col="outcome",
+        config=DiagnosticConfig(),
     )
-    df_h1 = pd.concat([df_h1, targets], axis=1)
-    df_h1 = df_h1.dropna(subset=["target_best"]).copy()
-    print(f"Bars with valid targets: {len(df_h1)}")
+    regime_results = regime_diag.run()
+    regime_report_text = _capture_output(regime_diag.print_report, regime_results)
+    regime_diag.plot(regime_results, save_path="regime_diagnostic.png")
 
-    dist = df_h1["target_best"].value_counts(normalize=True)
-    print(
-        "Target distribution:\n"
-        f"  +1 (long wins):  {dist.get(1.0, 0):.1%}\n"
-        f"  -1 (short wins): {dist.get(-1.0, 0):.1%}\n"
-        f"   0 (ambiguous):  {dist.get(0.0, 0):.1%}"
+    if not regime_results.get("conditional_edge_found", False):
+        final_lines = [
+            regime_report_text,
+            "",
+            "PIPELINE STATUS",
+            "No conditional edge was found in the raw base signals.",
+            "Skipping permutation importance and meta-labeling training.",
+            "Fix the entry logic before continuing.",
+        ]
+        final_report = "\n".join(line for line in final_lines if line is not None)
+        Path("backtest_report.txt").write_text(final_report, encoding="utf-8")
+        print("\nReport saved to backtest_report.txt")
+        print(f"\nTotal pipeline time: {time.time() - start_time:.1f}s")
+        return
+
+    print("\nSTEP 8: Building augmented diagnostic feature set...")
+    df_model, candidate_feature_cols = _build_augmented_feature_frame(df_meta, regime_diag.df)
+    importance_mask = (df_model["base_signal"] != 0) & df_model["barrier_label"].notna()
+    importance_mask &= df_model[candidate_feature_cols].notna().all(axis=1)
+    X_importance = df_model.loc[importance_mask, candidate_feature_cols]
+    y_importance = (df_model.loc[importance_mask, "barrier_label"] == 1).astype(int)
+    print(f"Candidate feature columns: {len(candidate_feature_cols)}")
+    print(f"Rows for feature importance: {len(X_importance)}")
+
+    print("\nSTEP 9: Running permutation feature importance...")
+    importance_pipe = FeatureImportancePipeline(
+        X_importance,
+        y_importance,
+        config=PipelineConfig(
+            n_folds=5,
+            purge_bars=PURGE_GAP,
+            embargo_bars=EMBARGO_GAP,
+            max_features_to_keep=8,
+        ),
     )
+    importance_results = importance_pipe.run()
+    importance_report_text = _capture_output(importance_pipe.print_report, importance_results)
+    importance_pipe.plot(importance_results, save_path="feature_importance.png")
 
-    print("\nSTEP 5: Lookahead bias check...")
-    bias_warnings = detect_lookahead_bias(df_h1, feature_cols, "target_best")
-    for warning in bias_warnings:
+    selected_feature_cols = [item["feature"] for item in importance_results["feature_selection"]["selected"]]
+    if not selected_feature_cols:
+        selected_feature_cols = list(META_FEATURE_COLS) + ["direction_code", "reason_sma_cross", "reason_breakout"]
+        print("No features beat the noise baseline. Falling back to the core meta feature set.")
+    else:
+        print(f"Selected feature columns ({len(selected_feature_cols)}):")
+        for column in selected_feature_cols:
+            print(f"  - {column}")
+
+    print("\nSTEP 10: Lookahead bias check...")
+    bias_frame = df_model.loc[df_model["outcome_binary"].notna()].copy()
+    for warning in detect_lookahead_bias(bias_frame, selected_feature_cols, "outcome_binary"):
         print(f"  {warning}")
 
-    print("\nCorrelation audit (|corr| > 0.15 with target):")
-    for column in feature_cols:
-        corr = df_h1[column].corr(df_h1["target_best"])
+    print("\nCorrelation audit (|corr| > 0.15 with outcome_binary):")
+    for column in selected_feature_cols:
+        corr = bias_frame[column].corr(bias_frame["outcome_binary"])
         if pd.notna(corr) and abs(float(corr)) > 0.15:
             flag = " ⚠️ INVESTIGATE" if abs(float(corr)) > 0.30 else ""
             print(f"  {column}: {float(corr):.4f}{flag}")
 
-    results_a = run_mode_a_direct_prediction(df_h1, feature_cols, "target_best")
-    report_a = generate_backtest_report(results_a, title="MODE A")
-    print(report_a)
+    print("\nSTEP 11: Running meta-labeling walk-forward validation...")
+    results = walk_forward_meta_labeling(
+        df_model,
+        selected_feature_cols,
+        train_months=6,
+        test_months=1,
+        purge_gap=PURGE_GAP,
+        embargo_gap=EMBARGO_GAP,
+        risk_per_trade=0.01,
+        thresholds=THRESHOLDS,
+        meta_config=META_CONFIG,
+    )
+    results["regime_diagnostic"] = {
+        "conditional_edge_found": bool(regime_results.get("conditional_edge_found", False)),
+        "edge_bucket_count": len(regime_results.get("edge_buckets", [])),
+        "edge_buckets": regime_results.get("edge_buckets", [])[:10],
+    }
+    results["feature_importance"] = {
+        "candidate_feature_count": len(candidate_feature_cols),
+        "selected_feature_count": len(selected_feature_cols),
+        "selected_features": selected_feature_cols,
+        "noise_threshold": importance_results["feature_selection"]["threshold"],
+        "noise_median": importance_results["feature_selection"]["noise_median"],
+        "shuffle_accuracy": importance_results["label_shuffle"]["mean_shuffle_acc"],
+        "shuffle_accuracy_legacy": importance_results["label_shuffle"]["old_mean_shuffle_acc"],
+        "shuffle_accuracy_balanced": importance_results["label_shuffle"]["balanced_mean_shuffle_acc"],
+        "leakage_suspected": importance_results["label_shuffle"]["leakage_suspected"],
+    }
 
-    results_b = run_mode_b_meta_labeling(df_h1, feature_cols)
-    report_b = None
-    if results_b is not None:
-        report_b = generate_backtest_report(results_b, title="MODE B")
-        print(report_b)
-
-    print("\n" + "=" * 60)
-    print("SIDE-BY-SIDE COMPARISON")
-    print("=" * 60)
-    print(f"{'Metric':<25} {'Mode A':>12} {'Mode B':>12}")
-    print("-" * 49)
-    for metric in ["total_return", "max_drawdown", "win_rate", "profit_factor", "sharpe_ratio", "total_trades"]:
-        value_a = results_a.get(metric, "N/A")
-        value_b = results_b.get(metric, "N/A") if results_b is not None else "N/A"
-        print(f"{metric:<25} {str(value_a):>12} {str(value_b):>12}")
-
-    best_mode = "A"
-    best_results = results_a
-    if results_b is not None and _parse_checks_passed(results_b.get("checks_passed")) > _parse_checks_passed(results_a.get("checks_passed")):
-        best_mode = "B"
-        best_results = results_b
-
-    print(f"\nBest performing mode: {best_mode}")
-    print(f"Verdict: {best_results['verdict']}")
-
-    report_sections = [report_a]
-    if report_b is not None:
-        report_sections.append(report_b)
-    full_report = "\n\n".join(report_sections)
-    report_path = Path("backtest_report.txt")
-    report_path.write_text(full_report, encoding="utf-8")
+    print("\nSTEP 12: Generating report...")
+    report = generate_backtest_report(results)
+    print(report)
+    full_report = "\n\n".join(section for section in [regime_report_text, importance_report_text, report] if section)
+    Path("backtest_report.txt").write_text(full_report, encoding="utf-8")
     print("\nReport saved to backtest_report.txt")
-
-    elapsed = time.time() - start_time
-    print(f"\nTotal pipeline time: {elapsed:.1f}s")
-
-    try:
-        win_rate = float(str(best_results["win_rate"]).strip("%")) / 100.0
-        sharpe_ratio = float(best_results["sharpe_ratio"])
-        if win_rate > 0.65:
-            print("\nWARNING: Win rate > 65% is suspicious. Possible residual leakage.")
-        if sharpe_ratio > 2.0:
-            print("WARNING: Sharpe > 2.0 is suspicious. Possible residual leakage.")
-        if win_rate > 0.65 and sharpe_ratio > 2.0:
-            print("LIKELY STILL LEAKING. Re-audit features, targets, and fold separation.")
-    except (KeyError, TypeError, ValueError):
-        pass
+    print(f"\nTotal pipeline time: {time.time() - start_time:.1f}s")
 
 
 if __name__ == "__main__":

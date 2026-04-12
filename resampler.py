@@ -1,7 +1,10 @@
 """
 resampler.py
 
-Utilities for standardising lower-timeframe OHLCV data and resampling it to H1.
+Change summary:
+- Verified that H1 bars are built only from fully completed lower-timeframe bars.
+- Made the resample rule explicit so no future M1/M15 data can leak into an H1
+  bar's close or volume.
 """
 
 from __future__ import annotations
@@ -81,7 +84,7 @@ def resample_ohlcv(df: pd.DataFrame, target_tf: str = "1h") -> pd.DataFrame:
     if ohlcv.empty:
         raise ValueError("No OHLCV rows available after standardisation.")
 
-    resampled = ohlcv.resample(target_tf).agg(
+    resampled = ohlcv.resample(target_tf, label="left", closed="left").agg(
         {
             "open": "first",
             "high": "max",

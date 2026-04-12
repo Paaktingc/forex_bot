@@ -1,8 +1,13 @@
 """
 labelling.py
 
-Causally clean target generation for the EURUSD research pipeline plus legacy
-helpers still used by the original bot codepaths.
+Change summary:
+- Added a base-signal layer for meta-labeling using SMA crossovers and breakout
+  entries.
+- Added Triple Barrier labeling for each candidate signal using ATR(20), a
+  +1.5 ATR target, a -1 ATR stop, and a 10-bar horizon.
+- Kept the bar-wise causal target helpers and the legacy triple-barrier code
+  used by older bot paths.
 """
 
 from __future__ import annotations
@@ -251,7 +256,7 @@ def _compute_trade_target_array(
             take_profit = entry_price - tp_atr_mult * atr_value
             stop_loss = entry_price + sl_atr_mult * atr_value
 
-        outcome = 0.0
+        outcome = np.nan
         scan_stop = min(entry_idx + max_holding_bars, len(open_prices))
         for future_idx in range(entry_idx, scan_stop):
             high_value = high_prices[future_idx]
@@ -267,7 +272,7 @@ def _compute_trade_target_array(
                 hit_sl = high_value >= stop_loss
 
             if hit_tp and hit_sl:
-                outcome = 0.0
+                outcome = np.nan
                 break
             if hit_tp:
                 outcome = 1.0
@@ -283,11 +288,12 @@ def _compute_trade_target_array(
 
 def compute_trade_target(
     df: pd.DataFrame,
-    atr_col: str = "atr_14",
-    tp_atr_mult: float = 1.5,
+    atr_col: str = "atr_20_target",
+    tp_atr_mult: float = 1.0,
     sl_atr_mult: float = 1.0,
-    max_holding_bars: int = 24,
+    max_holding_bars: int = 10,
     direction: str = "long",
+    atr_period: int = 20,
 ) -> pd.Series:
     """
     Binary trade outcome target with strict next-bar execution.
@@ -295,19 +301,28 @@ def compute_trade_target(
     Features at bar ``t`` may only use data available by the close of ``t``.
     The target for bar ``t`` therefore starts at the next bar:
       - entry = open[t+1]
-      - TP/SL distance = ATR[t] multipliers
+      - TP/SL distance = ATR(20)[t] multipliers
       - future scan window = bars [t+1, t+1+max_holding_bars)
+
+    A target is:
+      - 1 if TP is hit before SL
+      - 0 if SL is hit before TP
+      - NaN if neither is hit within the window or the path is ambiguous
 
     The last ``max_holding_bars`` rows are always NaN because the future path is
     incomplete.
     """
-    clean = _validate_target_frame(df, atr_col)
+    clean = df.sort_index().copy()
     if max_holding_bars <= 0:
         raise ValueError("max_holding_bars must be positive.")
     if tp_atr_mult <= 0 or sl_atr_mult <= 0:
         raise ValueError("TP/SL ATR multipliers must be positive.")
     if direction not in TRADE_DIRECTIONS:
         raise ValueError(f"direction must be one of {sorted(TRADE_DIRECTIONS)}")
+    _validate_ohlc_frame(clean)
+    if atr_col not in clean.columns:
+        clean[atr_col] = compute_atr(clean, period=atr_period)
+    clean = _validate_target_frame(clean, atr_col)
 
     labels = _compute_trade_target_array(
         open_prices=clean["open"].to_numpy(dtype=float),
@@ -324,10 +339,11 @@ def compute_trade_target(
 
 def generate_directional_targets(
     df: pd.DataFrame,
-    atr_col: str = "atr_14",
-    tp_atr_mult: float = 1.5,
+    atr_col: str = "atr_20_target",
+    tp_atr_mult: float = 1.0,
     sl_atr_mult: float = 1.0,
-    max_holding_bars: int = 24,
+    max_holding_bars: int = 10,
+    atr_period: int = 20,
 ) -> pd.DataFrame:
     """
     Generate causally clean long/short trade outcomes for every bar.
@@ -335,10 +351,13 @@ def generate_directional_targets(
     ``target_best`` answers:
       - ``+1`` if the long trade has edge and the short does not
       - ``-1`` if the short trade has edge and the long does not
-      - ``0`` if both lose or both win
-      - ``NaN`` if there is not enough future data to evaluate the trade
+      - ``NaN`` if neither side has a clean edge within the forward window
     """
-    clean = _validate_target_frame(df, atr_col)
+    clean = df.sort_index().copy()
+    _validate_ohlc_frame(clean)
+    if atr_col not in clean.columns:
+        clean[atr_col] = compute_atr(clean, period=atr_period)
+    clean = _validate_target_frame(clean, atr_col)
     target_long = compute_trade_target(
         clean,
         atr_col=atr_col,
@@ -346,6 +365,7 @@ def generate_directional_targets(
         sl_atr_mult=sl_atr_mult,
         max_holding_bars=max_holding_bars,
         direction="long",
+        atr_period=atr_period,
     )
     target_short = compute_trade_target(
         clean,
@@ -354,22 +374,235 @@ def generate_directional_targets(
         sl_atr_mult=sl_atr_mult,
         max_holding_bars=max_holding_bars,
         direction="short",
+        atr_period=atr_period,
     )
 
     target_best = pd.Series(np.nan, index=clean.index, name="target_best", dtype=float)
-    valid_mask = target_long.notna() & target_short.notna()
-    target_best.loc[valid_mask] = 0.0
-    target_best.loc[valid_mask & (target_long == 1.0) & (target_short == 0.0)] = 1.0
-    target_best.loc[valid_mask & (target_short == 1.0) & (target_long == 0.0)] = -1.0
+    target_best.loc[(target_long == 1.0) & (target_short == 0.0)] = 1.0
+    target_best.loc[(target_short == 1.0) & (target_long == 0.0)] = -1.0
 
     return pd.DataFrame(
         {
             "target_long": target_long,
             "target_short": target_short,
             "target_best": target_best,
+            "target_signal": target_best,
+            atr_col: clean[atr_col],
         },
         index=clean.index,
     )
+
+
+def generate_base_strategy_signals(
+    df: pd.DataFrame,
+    sma_fast: int = 20,
+    sma_slow: int = 50,
+    breakout_window: int = 20,
+) -> pd.DataFrame:
+    """
+    Generate candidate entries for the meta-labeler.
+
+    Rules:
+    - long on SMA(20) crossing above SMA(50)
+    - short on SMA(20) crossing below SMA(50)
+    - long on close breaking above the previous 20-bar high
+    - short on close breaking below the previous 20-bar low
+
+    The signal is observed on completed bar ``t`` and executed at ``open[t+1]``.
+    """
+    clean = df.sort_index().copy()
+    _validate_ohlc_frame(clean)
+    if not isinstance(clean.index, pd.DatetimeIndex):
+        raise ValueError("Signal generation requires a DatetimeIndex.")
+
+    close = clean["close"]
+    sma_fast_series = close.rolling(sma_fast, min_periods=sma_fast).mean()
+    sma_slow_series = close.rolling(sma_slow, min_periods=sma_slow).mean()
+    cross_up = (sma_fast_series > sma_slow_series) & (sma_fast_series.shift(1) <= sma_slow_series.shift(1))
+    cross_down = (sma_fast_series < sma_slow_series) & (sma_fast_series.shift(1) >= sma_slow_series.shift(1))
+
+    prior_high = clean["high"].shift(1).rolling(breakout_window, min_periods=breakout_window).max()
+    prior_low = clean["low"].shift(1).rolling(breakout_window, min_periods=breakout_window).min()
+    breakout_up = close > prior_high
+    breakout_down = close < prior_low
+
+    records: list[dict[str, object]] = []
+    index_values = list(clean.index)
+    for idx, timestamp in enumerate(index_values[:-1]):
+        reasons: list[tuple[int, str]] = []
+        if bool(cross_up.loc[timestamp]):
+            reasons.append((1, "sma_cross_long"))
+        if bool(cross_down.loc[timestamp]):
+            reasons.append((-1, "sma_cross_short"))
+        if bool(breakout_up.loc[timestamp]):
+            reasons.append((1, "breakout_long"))
+        if bool(breakout_down.loc[timestamp]):
+            reasons.append((-1, "breakout_short"))
+
+        if not reasons:
+            continue
+
+        long_reasons = [reason for direction, reason in reasons if direction == 1]
+        short_reasons = [reason for direction, reason in reasons if direction == -1]
+        if long_reasons and short_reasons:
+            continue
+
+        direction = 1 if long_reasons else -1
+        reason_code = "+".join(long_reasons if long_reasons else short_reasons)
+        records.append(
+            {
+                "signal_time": timestamp,
+                "entry_timestamp": index_values[idx + 1],
+                "signal": direction,
+                "direction": "long" if direction == 1 else "short",
+                "reason_code": reason_code,
+            }
+        )
+
+    if not records:
+        return pd.DataFrame(columns=["entry_timestamp", "signal", "direction", "reason_code"])
+
+    signals = pd.DataFrame.from_records(records).set_index("signal_time").sort_index()
+    signals.index.name = "signal_time"
+    return signals
+
+
+def label_base_signals_with_triple_barrier(
+    df: pd.DataFrame,
+    signals: pd.DataFrame,
+    atr_col: str = "atr_20_target",
+    tp_atr_mult: float = 1.5,
+    sl_atr_mult: float = 1.0,
+    max_holding_bars: int = 10,
+    atr_period: int = 20,
+) -> pd.DataFrame:
+    """
+    Label candidate signals with Triple Barrier outcomes.
+
+    Outcome labels:
+    - ``+1`` = WIN
+    - ``-1`` = LOSS
+    - ``0``  = TIMEOUT / ambiguous
+    """
+    clean = df.sort_index().copy()
+    _validate_ohlc_frame(clean)
+    if atr_col not in clean.columns:
+        clean[atr_col] = compute_atr(clean, period=atr_period)
+
+    if signals is None or signals.empty:
+        return pd.DataFrame(
+            columns=[
+                "entry_timestamp",
+                "signal",
+                "direction",
+                "reason_code",
+                "barrier_label",
+                "outcome_binary",
+                "realized_r",
+                "entry_price",
+                "tp_price",
+                "sl_price",
+            ]
+        )
+
+    positions = {timestamp: idx for idx, timestamp in enumerate(clean.index)}
+    open_prices = clean["open"].to_numpy(dtype=float)
+    high_prices = clean["high"].to_numpy(dtype=float)
+    low_prices = clean["low"].to_numpy(dtype=float)
+    atr_values = clean[atr_col].to_numpy(dtype=float)
+
+    labelled_rows: list[dict[str, object]] = []
+    for timestamp, signal_row in signals.sort_index().iterrows():
+        pos = positions.get(timestamp)
+        if pos is None or pos + 1 >= len(clean.index):
+            continue
+
+        atr_value = atr_values[pos]
+        entry_pos = pos + 1
+        entry_price = open_prices[entry_pos]
+        if np.isnan(atr_value) or atr_value <= 0 or np.isnan(entry_price):
+            continue
+
+        direction = int(signal_row["signal"])
+        if direction == 1:
+            tp_price = entry_price + tp_atr_mult * atr_value
+            sl_price = entry_price - sl_atr_mult * atr_value
+        else:
+            tp_price = entry_price - tp_atr_mult * atr_value
+            sl_price = entry_price + sl_atr_mult * atr_value
+
+        barrier_label = np.nan
+        scan_stop = min(entry_pos + max_holding_bars, len(clean.index))
+        for future_pos in range(entry_pos, scan_stop):
+            high_value = high_prices[future_pos]
+            low_value = low_prices[future_pos]
+            if np.isnan(high_value) or np.isnan(low_value):
+                continue
+
+            if direction == 1:
+                hit_tp = high_value >= tp_price
+                hit_sl = low_value <= sl_price
+            else:
+                hit_tp = low_value <= tp_price
+                hit_sl = high_value >= sl_price
+
+            if hit_tp and hit_sl:
+                barrier_label = 0
+                break
+            if hit_tp:
+                barrier_label = 1
+                break
+            if hit_sl:
+                barrier_label = -1
+                break
+
+        if np.isnan(barrier_label):
+            barrier_label = 0
+
+        outcome_binary = np.nan
+        realized_r = 0.0
+        if barrier_label == 1:
+            outcome_binary = 1.0
+            realized_r = float(tp_atr_mult)
+        elif barrier_label == -1:
+            outcome_binary = 0.0
+            realized_r = -float(sl_atr_mult)
+
+        labelled_rows.append(
+            {
+                "signal_time": timestamp,
+                "entry_timestamp": signal_row["entry_timestamp"],
+                "signal": direction,
+                "direction": signal_row["direction"],
+                "reason_code": signal_row["reason_code"],
+                "barrier_label": int(barrier_label),
+                "outcome_binary": outcome_binary,
+                "realized_r": realized_r,
+                "entry_price": float(entry_price),
+                "tp_price": float(tp_price),
+                "sl_price": float(sl_price),
+            }
+        )
+
+    if not labelled_rows:
+        return pd.DataFrame(
+            columns=[
+                "entry_timestamp",
+                "signal",
+                "direction",
+                "reason_code",
+                "barrier_label",
+                "outcome_binary",
+                "realized_r",
+                "entry_price",
+                "tp_price",
+                "sl_price",
+            ]
+        )
+
+    labelled = pd.DataFrame.from_records(labelled_rows).set_index("signal_time").sort_index()
+    labelled.index.name = "signal_time"
+    return labelled
 
 
 def apply_triple_barrier(df: pd.DataFrame) -> pd.DataFrame:

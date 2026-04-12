@@ -1,8 +1,17 @@
 """
 features.py
 
-Feature engineering module for technical indicators, session embeddings,
-and multi-timeframe trends.
+Change summary:
+- Rebuilt the research feature set around meta-labeling at signal time.
+- Added trend, momentum, volatility, market structure, regime, and time
+  features that use only information available by the close of bar t.
+- Kept the legacy M15 feature path intact for the original bot modules.
+
+Causality boundary for the research pipeline:
+- A signal is generated after H1 bar t has fully closed.
+- Every feature below uses only values from bar t and earlier.
+- Any trade entry and target evaluation starts at open[t+1].
+- No research feature may use shift(-1), centered windows, or future bars.
 """
 
 import logging
@@ -14,26 +23,26 @@ from data_feed import get_ohlcv
 
 logger = logging.getLogger(__name__)
 
-H1_FEATURE_COLS = [
-    "atr_14",
-    "ema_20",
-    "ema_50",
-    "ema_200",
-    "ema_20_50_diff",
-    "close_ema20_diff",
-    "close_ema50_diff",
+META_FEATURE_COLS = [
+    "close_to_sma20_atr",
+    "close_to_sma50_atr",
+    "close_to_sma200_atr",
+    "lr_slope_20_atr",
     "rsi_14",
+    "roc_5_atr",
+    "roc_10_atr",
+    "roc_20_atr",
+    "atr_14",
+    "atr_20",
+    "bb_width_20",
+    "close_range_pos_20",
+    "range_20_atr",
     "adx_14",
-    "macd",
-    "macd_signal",
-    "macd_hist",
-    "bb_width",
-    "bb_pct",
-    "ret_1",
-    "ret_4",
-    "ret_24",
-    "vol_ratio",
+    "hour_of_day",
+    "day_of_week",
 ]
+
+H1_FEATURE_COLS = META_FEATURE_COLS
 
 FEATURE_COLS = [
     'rsi_14', 'macd_line', 'macd_signal', 'macd_hist',
@@ -126,66 +135,75 @@ def _rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
+def _rolling_linear_slope(series: pd.Series, window: int) -> pd.Series:
+    if window <= 1:
+        raise ValueError("window must be greater than 1")
+    x = np.arange(window, dtype=float)
+    x_mean = x.mean()
+    denominator = ((x - x_mean) ** 2).sum()
+
+    def _slope(values: np.ndarray) -> float:
+        values_mean = values.mean()
+        numerator = ((x - x_mean) * (values - values_mean)).sum()
+        return float(numerator / denominator) if denominator != 0 else np.nan
+
+    return series.rolling(window=window, min_periods=window).apply(_slope, raw=True)
+
+
 def feature_engineering_h1(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute H1 features using ONLY data at time ``t`` and earlier.
 
-    CAUSALITY AUDIT
-    - ``atr_14`` uses high/low/close up to and including bar ``t``
-    - ``ema_20`` / ``ema_50`` / ``ema_200`` use closes up to ``t``
-    - ``ema_20_50_diff`` is derived from current EMAs only
-    - ``close_ema20_diff`` / ``close_ema50_diff`` use ``close[t]`` only
-    - ``rsi_14`` uses closes up to ``t``
-    - ``adx_14`` uses high/low/close up to ``t``
-    - ``macd`` / ``macd_signal`` / ``macd_hist`` use closes up to ``t``
-    - ``bb_width`` / ``bb_pct`` use rolling windows ending at ``t``
-    - ``ret_1`` / ``ret_4`` / ``ret_24`` use trailing returns ending at ``t``
-    - ``vol_ratio`` uses trailing rolling volatility ending at ``t``
+    Decision boundary:
+    - the model observes a fully completed H1 bar at timestamp ``t``
+    - it decides after that bar closes
+    - execution, targets, and any trade simulation begin at ``open[t+1]``
+    - therefore features may use OHLCV from the completed bar ``t``, but never
+      any value from ``t+1`` or later
 
-    Forbidden and intentionally absent:
-    - forward returns such as ``close[t+1] / close[t]``
-    - centred rolling windows
-    - any feature derived from a target column
-    - any feature using ``open[t+1]``
-
-    The returned frame keeps OHLCV plus engineered features. Warmup rows with
-    incomplete indicators are dropped.
+    Feature groups:
+    - Trend: distances from SMA(20/50/200) in ATR units, plus 20-bar regression slope
+    - Momentum: RSI(14), 5/10/20-bar price change in ATR units
+    - Volatility: ATR(14), ATR(20), Bollinger width
+    - Market structure: close position in 20-bar range, range size in ATR units
+    - Regime: ADX(14)
+    - Time: hour of day, day of week
     """
     out = _validate_h1_frame(df)
     close = out["close"]
-    atr = _atr(out, 14)
-    atr_safe = atr.replace(0, np.nan)
+    out["atr_14"] = _atr(out, 14)
+    out["atr_20"] = _atr(out, 20)
+    out["atr_20_target"] = out["atr_20"]
+    atr_safe = out["atr_20"].replace(0, np.nan)
 
-    out["atr_14"] = atr
-    out["ema_20"] = close.ewm(span=20, adjust=False, min_periods=20).mean()
-    out["ema_50"] = close.ewm(span=50, adjust=False, min_periods=50).mean()
-    out["ema_200"] = close.ewm(span=200, adjust=False, min_periods=200).mean()
-    out["ema_20_50_diff"] = (out["ema_20"] - out["ema_50"]) / atr_safe
-    out["close_ema20_diff"] = (close - out["ema_20"]) / atr_safe
-    out["close_ema50_diff"] = (close - out["ema_50"]) / atr_safe
+    out["sma_20"] = close.rolling(20, min_periods=20).mean()
+    out["sma_50"] = close.rolling(50, min_periods=50).mean()
+    out["sma_200"] = close.rolling(200, min_periods=200).mean()
+    out["close_to_sma20_atr"] = (close - out["sma_20"]) / atr_safe
+    out["close_to_sma50_atr"] = (close - out["sma_50"]) / atr_safe
+    out["close_to_sma200_atr"] = (close - out["sma_200"]) / atr_safe
+    out["lr_slope_20_atr"] = _rolling_linear_slope(close, 20) / atr_safe
     out["rsi_14"] = _rsi_wilder(close, 14)
     out["adx_14"] = _adx(out, 14)
 
-    ema12 = close.ewm(span=12, adjust=False, min_periods=12).mean()
-    ema26 = close.ewm(span=26, adjust=False, min_periods=26).mean()
-    out["macd"] = ema12 - ema26
-    out["macd_signal"] = out["macd"].ewm(span=9, adjust=False, min_periods=9).mean()
-    out["macd_hist"] = out["macd"] - out["macd_signal"]
+    out["roc_5_atr"] = (close - close.shift(5)) / atr_safe
+    out["roc_10_atr"] = (close - close.shift(10)) / atr_safe
+    out["roc_20_atr"] = (close - close.shift(20)) / atr_safe
 
-    sma20 = close.rolling(20, min_periods=20).mean()
+    sma20 = out["sma_20"]
     std20 = close.rolling(20, min_periods=20).std(ddof=0)
-    out["bb_width"] = (2.0 * std20) / sma20.replace(0, np.nan)
-    out["bb_pct"] = (close - (sma20 - 2.0 * std20)) / (4.0 * std20).replace(0, np.nan)
+    out["bb_width_20"] = std20 / sma20.replace(0, np.nan)
 
-    out["ret_1"] = close.pct_change(1)
-    out["ret_4"] = close.pct_change(4)
-    out["ret_24"] = close.pct_change(24)
+    rolling_high_20 = out["high"].rolling(20, min_periods=20).max()
+    rolling_low_20 = out["low"].rolling(20, min_periods=20).min()
+    range_20 = (rolling_high_20 - rolling_low_20).replace(0, np.nan)
+    out["close_range_pos_20"] = (close - rolling_low_20) / range_20
+    out["range_20_atr"] = range_20 / atr_safe
 
-    short_vol = close.pct_change().rolling(5, min_periods=5).std()
-    long_vol = close.pct_change().rolling(20, min_periods=20).std().replace(0, np.nan)
-    out["vol_ratio"] = short_vol / long_vol
+    out["hour_of_day"] = out.index.hour.astype(int)
+    out["day_of_week"] = out.index.dayofweek.astype(int)
 
-    out = out.dropna(subset=H1_FEATURE_COLS).copy()
+    out = out.dropna(subset=META_FEATURE_COLS).copy()
     return out
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
