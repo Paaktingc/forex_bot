@@ -1,7 +1,7 @@
 """
 health_check.py
 
-Basic live-environment checks for a Windows VPS deployment.
+Basic live-environment checks for the configured live broker deployment.
 """
 
 from __future__ import annotations
@@ -31,10 +31,10 @@ def _run_check(name: str, fn: Callable[[], None]) -> bool:
         return False
 
 
-def _check_mt5_connection() -> None:
-    balance = data_feed.connect_mt5()
+def _check_broker_connection() -> None:
+    balance = data_feed.connect_broker()
     if balance <= 0:
-        raise RuntimeError(f"Unexpected MT5 balance returned: {balance}")
+        raise RuntimeError(f"Unexpected broker balance returned: {balance}")
 
 
 def _check_data_feed() -> None:
@@ -66,7 +66,7 @@ def _check_risk_manager() -> None:
 
 def main() -> None:
     checks = [
-        ("MT5 connection", _check_mt5_connection),
+        (f"{config.BROKER} connection", _check_broker_connection),
         ("Data feed", _check_data_feed),
         ("Model load", _check_model_load),
         ("News filter", _check_news_filter),
@@ -76,9 +76,9 @@ def main() -> None:
     results = [_run_check(name, fn) for name, fn in checks]
 
     if all(results):
-        print("VPS READY FOR LIVE TRADING")
+        print("ENVIRONMENT READY FOR LIVE TRADING")
     else:
-        print("VPS NOT READY")
+        print("ENVIRONMENT NOT READY")
 
 
 if __name__ == "__main__":

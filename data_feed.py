@@ -2,13 +2,14 @@
 data_feed.py
 """
 
-import os
 import logging
+import os
 import pandas as pd
-from typing import Dict, Any
-from dotenv import load_dotenv
+from typing import Dict
 
 import config
+from brokers import get_broker
+from brokers.mt5_adapter import MT5BrokerAdapter
 
 try:
     import MetaTrader5 as mt5
@@ -32,38 +33,35 @@ def _require_mt5() -> None:
             "MT5 not available. Deploy to Windows VPS for live trading."
         )
 
+def _active_broker():
+    return get_broker()
+
 def connect_mt5() -> float:
     """Connects to MT5 and returns account balance."""
+    if config.BROKER == "ctrader":
+        return _active_broker().connect()
     try:
-        _require_mt5()
-        load_dotenv()
-        login_str = os.getenv("MT5_LOGIN") or os.getenv("MT5_ACCOUNT")
-        password = os.getenv("MT5_PASSWORD")
-        server = os.getenv("MT5_SERVER")
-        
-        if not (login_str and password and server):
-            raise ConnectionError("Missing MT5 credentials in .env")
-            
-        login = int(login_str)
-        
-        if not mt5.initialize(login=login, password=password, server=server):
-            raise ConnectionError(f"MT5 initialization failed: {mt5.last_error()}")
-            
-        account_info = mt5.account_info()
-        if account_info is None:
-            raise ConnectionError(f"Failed to get account info: {mt5.last_error()}")
-            
-        balance = float(account_info.balance)
-        logger.info(f"Connected | Account: {login} | Balance: {balance}")
-        
-        return balance
+        return MT5BrokerAdapter(mt5_module=mt5).connect()
         
     except Exception as e:
         logger.error(f"Error connecting to MT5: {str(e)}")
         raise
 
+def connect_broker() -> float:
+    """Connects to the configured live broker and returns account balance."""
+    return connect_mt5()
+
+def shutdown_broker() -> None:
+    """Shuts down the configured broker connection."""
+    if config.BROKER == "ctrader":
+        _active_broker().shutdown()
+    elif mt5 is not None and hasattr(mt5, "shutdown"):
+        mt5.shutdown()
+
 def get_ohlcv(symbol: str, timeframe_str: str, bars: int) -> pd.DataFrame:
     """Fetches historical OHLCV data."""
+    if config.BROKER == "ctrader":
+        return _active_broker().get_ohlcv(symbol, timeframe_str, bars)
     try:
         _require_mt5()
         timeframe_map = {
@@ -131,6 +129,8 @@ def get_ohlcv_from_csv(symbol: str, timeframe_str: str) -> pd.DataFrame:
 
 def get_latest_tick(symbol: str) -> Dict[str, float]:
     """Retrieves the latest tick and calculates spread in pips."""
+    if config.BROKER == "ctrader":
+        return _active_broker().get_latest_tick(symbol)
     try:
         _require_mt5()
         tick = mt5.symbol_info_tick(symbol)
@@ -154,6 +154,8 @@ def get_latest_tick(symbol: str) -> Dict[str, float]:
 
 def get_account_info() -> Dict[str, float]:
     """Retrieves account information including calculated drawdown percentage."""
+    if config.BROKER == "ctrader":
+        return _active_broker().get_account_info()
     try:
         _require_mt5()
         info = mt5.account_info()

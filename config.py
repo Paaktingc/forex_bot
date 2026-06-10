@@ -1,8 +1,8 @@
 """
 config.py
 
-Centralized configuration file for the MT5 Forex ML bot.
-Contains all constants, risk parameters, and model settings.
+Centralized configuration file for the Forex ML bot.
+Contains broker selection, risk parameters, and model settings.
 """
 
 import os
@@ -24,6 +24,12 @@ SYMBOL = "EURUSD"
 TIMEFRAME_PRIMARY = "M15"
 TIMEFRAME_TREND = "H1"
 BARS_TO_FETCH = 35000
+BROKER = os.getenv("BROKER", "mt5").lower()
+BOT_LABEL = "ML_BOT_V1"
+
+# cTrader Open API
+CTRADER_ENV = os.getenv("CTRADER_ENV", "demo").lower()
+CTRADER_UNITS_PER_LOT = 100_000
 
 # Risk Management & The5ers Hard Rules
 STARTING_BALANCE = None

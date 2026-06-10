@@ -1,11 +1,11 @@
 # THE5ERS FOREX ML BOT
 
-A fully automated ML forex trading bot connecting Python to MetaTrader 5 (MT5) designed to pass The5ers Bootcamp prop firm evaluation.
+A fully automated ML forex trading bot with selectable MetaTrader 5 (MT5) and cTrader Open API broker backends, designed to pass The5ers Bootcamp prop firm evaluation.
 
 ## Requirements
 - Python 3.11+
-- Windows OS (MetaTrader5 library requirement)
-- MetaTrader 5 Terminal installed and running
+- For MT5: Windows OS, MetaTrader 5 Terminal installed and running
+- For cTrader: cTrader Open API app credentials and a demo or live cTrader account
 
 ## Setup Instructions
 
@@ -22,11 +22,12 @@ A fully automated ML forex trading bot connecting Python to MetaTrader 5 (MT5) d
    ```
 
 3. **Configure Environment Variables**:
-   Copy the `.env.example` file to `.env` and fill in your MetaTrader 5 credentials:
+   Copy the `.env.example` file to `.env` and choose your broker:
    ```bash
    cp .env.example .env
    ```
-   Edit `.env` to include your `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER`.
+   For MT5, keep `BROKER=mt5` and set `MT5_LOGIN`, `MT5_PASSWORD`, and `MT5_SERVER`.
+   For cTrader demo, set `BROKER=ctrader`, `CTRADER_ENV=demo`, and fill in `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`, `CTRADER_ACCESS_TOKEN`, `CTRADER_REFRESH_TOKEN`, and `CTRADER_ACCOUNT_ID`.
 
 4. **Verify Configurations**:
    Check `config.py` to reflect your specific phase thresholds, risk constraints, and parameters.
@@ -34,6 +35,7 @@ A fully automated ML forex trading bot connecting Python to MetaTrader 5 (MT5) d
 ## Running the Bot
 
 - **Testing**: Run `pytest tests/` to execute unit tests locally (a MacOS adapter/mock may be required if MT5 is absent).
-- **Main Bot**: Run `python main.py` to start the live trading loop natively on a Windows endpoint. Ensure MT5 is open or AutoLogin via the provided `.env`.
+- **Health Check**: Run `python health_check.py` after configuring `.env`.
+- **Main Bot**: Run `python main.py` to start the live trading loop. For MT5, ensure MT5 is open or AutoLogin via the provided `.env`; for cTrader, start with a demo account.
 
 This bot enforces strict daily limits (4%) and absolute drawdowns (4.5%), incorporates Machine Learning inference, and safeguards against rollover (21:00-22:00 UTC) and high-impact news windows.

@@ -43,9 +43,16 @@ if (Test-Path $pipExe) {
 
 Write-Host "Creating .env placeholder file..."
 @"
+BROKER=mt5
 MT5_LOGIN=REPLACE_WITH_YOUR_LOGIN
 MT5_PASSWORD=REPLACE_WITH_YOUR_PASSWORD
 MT5_SERVER=REPLACE_WITH_SERVER_NAME
+CTRADER_ENV=demo
+CTRADER_CLIENT_ID=REPLACE_WITH_CLIENT_ID
+CTRADER_CLIENT_SECRET=REPLACE_WITH_CLIENT_SECRET
+CTRADER_ACCESS_TOKEN=REPLACE_WITH_ACCESS_TOKEN
+CTRADER_REFRESH_TOKEN=REPLACE_WITH_REFRESH_TOKEN
+CTRADER_ACCOUNT_ID=REPLACE_WITH_ACCOUNT_ID
 TELEGRAM_BOT_TOKEN=REPLACE_WITH_TOKEN
 TELEGRAM_CHAT_ID=REPLACE_WITH_CHAT_ID
 "@ | Out-File -FilePath (Join-Path $repoDir ".env") -Encoding UTF8
@@ -72,8 +79,8 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Pr
 Write-Host ""
 Write-Host "Setup complete."
 Write-Host "Next steps:"
-Write-Host "1. Edit C:\forex_bot\.env with real MT5 and Telegram credentials."
+Write-Host "1. Edit C:\forex_bot\.env with BROKER=mt5 or BROKER=ctrader and real credentials."
 Write-Host "2. Replace USERNAME in setup_vps.ps1 with your GitHub username or repo URL."
-Write-Host "3. Open MetaTrader 5 on the VPS and confirm your trading account is logged in."
+Write-Host "3. For MT5, open MetaTrader 5 and confirm login. For cTrader, use demo Open API credentials first."
 Write-Host "4. Run: $pythonExe C:\forex_bot\health_check.py"
 Write-Host "5. Reboot once or start the '$taskName' task manually to verify auto-start."

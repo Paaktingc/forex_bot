@@ -47,7 +47,7 @@ def test_get_current_m15_time_rounds_down():
 # ---------------------------------------------------------------------------
 
 @patch("main.model_module.load_model")
-@patch("main.data_feed.connect_mt5")
+@patch("main.data_feed.connect_broker")
 def test_initialize_bot(mock_connect, mock_load, capsys):
     mock_connect.return_value = 10_000.0
     mock_model = MagicMock()
@@ -76,16 +76,12 @@ def test_initialize_bot(mock_connect, mock_load, capsys):
 @patch("main.features")
 @patch("main.news_filter")
 @patch("main.data_feed")
-@patch("main.mt5")
 def test_process_candle_dry_run_logs_signal(
-    mock_mt5, mock_data_feed, mock_news, mock_features,
+    mock_data_feed, mock_news, mock_features,
     mock_execution, mock_journal, caplog,
 ):
     """When all checks pass and model returns a signal, dry-run should log but not place order."""
-    # Account equity
-    acct = MagicMock()
-    acct.equity = 10_000.0
-    mock_mt5.account_info.return_value = acct
+    mock_data_feed.get_account_info.return_value = {"equity": 10_000.0}
 
     # Execution: no open trades
     mock_execution.count_open_trades.return_value = 0
@@ -149,14 +145,10 @@ def test_process_candle_dry_run_logs_signal(
 
 @patch("main.execution")
 @patch("main.news_filter")
-@patch("main.mt5")
 def test_process_candle_blocked_by_news_filter(
-    mock_mt5, mock_news, mock_execution,
+    mock_news, mock_execution,
 ):
     """When news filter blocks, process_candle should return early."""
-    acct = MagicMock()
-    acct.equity = 10_000.0
-    mock_mt5.account_info.return_value = acct
     mock_execution.count_open_trades.return_value = 0
 
     # News filter blocks trading
@@ -170,7 +162,8 @@ def test_process_candle_blocked_by_news_filter(
         risk=RiskManager(10_000.0),
     )
 
-    with patch("risk_manager.is_rollover_window", return_value=False):
+    with patch("main.data_feed.get_account_info", return_value={"equity": 10_000.0}), \
+            patch("risk_manager.is_rollover_window", return_value=False):
         process_candle(state, dry_run=False)
 
     # Should never reach order placement
@@ -179,14 +172,10 @@ def test_process_candle_blocked_by_news_filter(
 
 @patch("main.execution")
 @patch("main.news_filter")
-@patch("main.mt5")
 def test_process_candle_blocked_by_drawdown(
-    mock_mt5, mock_news, mock_execution,
+    mock_news, mock_execution,
 ):
     """When drawdown limit is breached, process_candle should return early."""
-    acct = MagicMock()
-    acct.equity = 9_000.0  # well below 4.5% drawdown
-    mock_mt5.account_info.return_value = acct
     mock_execution.count_open_trades.return_value = 0
 
     from risk_manager import RiskManager
@@ -197,7 +186,8 @@ def test_process_candle_blocked_by_drawdown(
         risk=RiskManager(10_000.0),
     )
 
-    with patch("execution.close_all_positions"):
+    with patch("main.data_feed.get_account_info", return_value={"equity": 9_000.0}), \
+            patch("execution.close_all_positions"):
         process_candle(state, dry_run=False)
 
     # Should never call news filter or place order
@@ -207,14 +197,10 @@ def test_process_candle_blocked_by_drawdown(
 
 @patch("main.execution")
 @patch("main.news_filter")
-@patch("main.mt5")
 def test_process_candle_rollover_blocks_trading(
-    mock_mt5, mock_news, mock_execution,
+    mock_news, mock_execution,
 ):
     """When rollover window is active, can_trade() returns False."""
-    acct = MagicMock()
-    acct.equity = 10_000.0
-    mock_mt5.account_info.return_value = acct
     mock_execution.count_open_trades.return_value = 0
 
     from risk_manager import RiskManager
@@ -225,7 +211,8 @@ def test_process_candle_rollover_blocks_trading(
         risk=RiskManager(10_000.0),
     )
 
-    with patch("risk_manager.is_rollover_window", return_value=True):
+    with patch("main.data_feed.get_account_info", return_value={"equity": 10_000.0}), \
+            patch("risk_manager.is_rollover_window", return_value=True):
         process_candle(state, dry_run=False)
 
     mock_news.is_news_window.assert_not_called()

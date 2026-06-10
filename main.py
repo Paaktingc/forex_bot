@@ -13,13 +13,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-try:
-    import MetaTrader5 as mt5
-    MT5_AVAILABLE = True
-except ImportError:
-    mt5 = None
-    MT5_AVAILABLE = False
-    logging.warning("MetaTrader5 not available — Mac/dev mode")
 from sklearn.preprocessing import LabelEncoder
 
 import config
@@ -73,19 +66,14 @@ def get_current_m15_time() -> datetime:
 
 def initialize_bot(dry_run: bool = False) -> BotState:
     """
-    Connects to MT5, loads model + label encoder, creates RiskManager,
+    Connects to the configured broker, loads model + label encoder, creates RiskManager,
     prints a startup banner, and returns BotState.
     """
     from risk_manager import RiskManager
 
-    if not MT5_AVAILABLE:
-        raise RuntimeError(
-            "Cannot run live bot without MT5. Use --dry-run with mock data, or deploy to Windows VPS."
-        )
-
-    # 1. Connect to MT5 and obtain starting balance
-    starting_balance = data_feed.connect_mt5()
-    logger.info(f"Connected to MT5 — starting balance: {starting_balance}")
+    # 1. Connect to broker and obtain starting balance
+    starting_balance = data_feed.connect_broker()
+    logger.info(f"Connected to {config.BROKER} — starting balance: {starting_balance}")
 
     # 2. Load model + label encoder
     xgb_model, label_enc = model_module.load_model()
@@ -103,6 +91,7 @@ def initialize_bot(dry_run: bool = False) -> BotState:
         "╔══════════════════════════════════════╗\n"
         "║    THE5ERS ML FOREX BOT v1.0        ║\n"
         f"║    Symbol: {SYMBOL:<7s} |  TF: M15       ║\n"
+        f"║    Broker: {config.BROKER:<25s}║\n"
         f"║    Mode: {mode_label:<27s}║\n"
         f"║    Balance: {starting_balance:<24.2f}║\n"
         "╚══════════════════════════════════════╝"
@@ -134,11 +123,11 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
 
     # Step 1: current equity
     try:
-        acct = mt5.account_info()
-        if acct is None:
-            logger.error("process_candle: mt5.account_info() returned None.")
+        acct = data_feed.get_account_info()
+        if not acct:
+            logger.error("process_candle: broker account info returned empty.")
             return
-        equity = float(acct.equity)
+        equity = float(acct["equity"])
     except Exception as exc:
         logger.exception(f"process_candle: failed to read equity: {exc}")
         return
@@ -257,7 +246,7 @@ def main() -> None:
 
         except KeyboardInterrupt:
             logger.info("Shutting down (KeyboardInterrupt) ...")
-            mt5.shutdown()
+            data_feed.shutdown_broker()
             break
 
         except Exception as exc:

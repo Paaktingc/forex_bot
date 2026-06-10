@@ -1,11 +1,11 @@
 """
 execution.py
 
-All MT5 order placement, position management, and emergency close logic.
+Order placement, position management, and emergency close logic.
 Rules enforced here:
   - 2-second minimum delay between consecutive order placements
-  - try/except on every MT5 call
-  - All orders tagged with BOT_MAGIC_NUMBER for isolation
+  - try/except on broker calls
+  - MT5 orders tagged with BOT_MAGIC_NUMBER for isolation
 """
 
 import logging
@@ -22,6 +22,7 @@ except ImportError:
     logging.warning("MetaTrader5 not available — Mac/dev mode")
 
 import config
+from brokers import get_broker
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,10 @@ def _require_mt5() -> None:
         raise RuntimeError(
             "MT5 not available. Deploy to Windows VPS for live trading."
         )
+
+
+def _use_broker_adapter() -> bool:
+    return config.BROKER == "ctrader"
 
 
 def _enforce_order_delay() -> None:
@@ -64,7 +69,7 @@ def place_order(
     tp_price: float,
 ) -> Optional[dict]:
     """
-    Places a market order in MT5.
+    Places a market order through the configured broker.
 
     Args:
         symbol:   Trading symbol (e.g. "EURUSD").
@@ -76,6 +81,9 @@ def place_order(
     Returns:
         dict with ticket, price, sl, tp, volume, time — or None on failure.
     """
+    if _use_broker_adapter():
+        return get_broker().place_order(symbol, signal, lot, sl_price, tp_price)
+
     _require_mt5()
     _enforce_order_delay()
 
@@ -100,7 +108,7 @@ def place_order(
             "tp":           float(tp_price),
             "deviation":    10,
             "magic":        config.BOT_MAGIC_NUMBER,
-            "comment":      "ML_BOT_V1",
+            "comment":      config.BOT_LABEL,
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
@@ -158,6 +166,9 @@ def close_order(ticket: int) -> bool:
     Returns:
         True if closed successfully, False otherwise.
     """
+    if _use_broker_adapter():
+        return get_broker().close_order(ticket)
+
     _require_mt5()
     _enforce_order_delay()
 
@@ -195,7 +206,7 @@ def close_order(ticket: int) -> bool:
             "price":        float(price),
             "deviation":    10,
             "magic":        config.BOT_MAGIC_NUMBER,
-            "comment":      "ML_BOT_V1_CLOSE",
+            "comment":      f"{config.BOT_LABEL}_CLOSE",
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
@@ -232,6 +243,9 @@ def get_open_positions(symbol: Optional[str] = None) -> list[dict]:
         List of dicts: ticket, symbol, type, volume, open_price,
                        sl, tp, open_time, profit.
     """
+    if _use_broker_adapter():
+        return get_broker().get_open_positions(symbol)
+
     _require_mt5()
     try:
         if symbol:
@@ -272,6 +286,8 @@ def get_open_positions(symbol: Optional[str] = None) -> list[dict]:
 
 def count_open_trades(symbol: Optional[str] = None) -> int:
     """Returns the number of open bot positions (optionally filtered by symbol)."""
+    if _use_broker_adapter():
+        return get_broker().count_open_trades(symbol)
     return len(get_open_positions(symbol))
 
 
@@ -284,6 +300,9 @@ def check_min_duration(ticket: int) -> bool:
     Returns True if the position identified by *ticket* has been open for
     at least MIN_TRADE_DURATION seconds.
     """
+    if _use_broker_adapter():
+        return get_broker().check_min_duration(ticket)
+
     _require_mt5()
     try:
         positions = mt5.positions_get(ticket=ticket)
@@ -323,6 +342,9 @@ def close_all_positions() -> int:
     Returns:
         Number of positions successfully closed.
     """
+    if _use_broker_adapter():
+        return get_broker().close_all_positions()
+
     positions = get_open_positions()
     if not positions:
         logger.info("close_all_positions: no open positions to close.")
