@@ -32,12 +32,21 @@ META_FEATURE_COLS = [
     "roc_5_atr",
     "roc_10_atr",
     "roc_20_atr",
+    "fracdiff_close_d04_atr",
+    "fracdiff_slope_5",
     "atr_14",
     "atr_20",
     "bb_width_20",
+    "atr_20_vov_20",
+    "bb_width_vov_20",
     "close_range_pos_20",
     "range_20_atr",
     "adx_14",
+    "cusum_break",
+    "cusum_direction",
+    "bars_since_cusum",
+    "prob_high_vol_regime",
+    "prob_trend_regime",
     "hour_of_day",
     "day_of_week",
 ]
@@ -150,6 +159,118 @@ def _rolling_linear_slope(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=window).apply(_slope, raw=True)
 
 
+def _fracdiff_weights(d: float, threshold: float = 1e-4, max_size: int = 256) -> np.ndarray:
+    """
+    Fixed-width fractional differentiation weights for ``(1 - B)^d``.
+
+    The weights are deterministic for a chosen d, so this does not calibrate on
+    the full dataset. Calibrating d via ADF should happen inside train folds.
+    """
+    if not 0 < d < 1:
+        raise ValueError("d must be between 0 and 1.")
+    weights = [1.0]
+    for k in range(1, max_size):
+        weight = -weights[-1] * (d - k + 1) / k
+        if abs(weight) < threshold:
+            break
+        weights.append(float(weight))
+    return np.array(weights, dtype=float)
+
+
+def _fractional_diff_fixed_width(
+    series: pd.Series,
+    d: float = 0.4,
+    threshold: float = 1e-4,
+    max_size: int = 256,
+) -> pd.Series:
+    weights = _fracdiff_weights(d=d, threshold=threshold, max_size=max_size)
+    values = series.astype(float).to_numpy()
+    output = np.full(len(values), np.nan, dtype=float)
+    width = len(weights)
+
+    for row in range(width - 1, len(values)):
+        window = values[row - width + 1 : row + 1]
+        if np.isnan(window).any():
+            continue
+        output[row] = float(np.dot(weights, window[::-1]))
+
+    return pd.Series(output, index=series.index, name=f"fracdiff_d{d:g}")
+
+
+def _symmetric_cusum_events(
+    series: pd.Series,
+    threshold: pd.Series,
+) -> pd.DataFrame:
+    """
+    Causal symmetric CUSUM events using bar-to-bar price changes.
+
+    A non-zero event at t means the cumulative deviation breached the dynamic
+    threshold after observing the completed bar t.
+    """
+    clean_threshold = threshold.replace(0, np.nan)
+    diffs = series.diff()
+    events = pd.Series(0, index=series.index, dtype=int)
+    bars_since = pd.Series(np.nan, index=series.index, dtype=float)
+    pos_sum = 0.0
+    neg_sum = 0.0
+    last_event_pos: int | None = None
+
+    for pos, timestamp in enumerate(series.index):
+        diff = diffs.iloc[pos]
+        threshold_value = clean_threshold.iloc[pos]
+        if pd.isna(diff) or pd.isna(threshold_value) or threshold_value <= 0:
+            continue
+
+        pos_sum = max(0.0, pos_sum + float(diff))
+        neg_sum = min(0.0, neg_sum + float(diff))
+
+        event = 0
+        if pos_sum > float(threshold_value):
+            event = 1
+            pos_sum = 0.0
+            neg_sum = 0.0
+        elif neg_sum < -float(threshold_value):
+            event = -1
+            pos_sum = 0.0
+            neg_sum = 0.0
+
+        if event:
+            events.loc[timestamp] = event
+            last_event_pos = pos
+            bars_since.loc[timestamp] = 0.0
+        elif last_event_pos is not None:
+            bars_since.loc[timestamp] = float(pos - last_event_pos)
+
+    return pd.DataFrame(
+        {
+            "cusum_break": (events != 0).astype(int),
+            "cusum_direction": events.astype(int),
+            "bars_since_cusum": bars_since,
+        },
+        index=series.index,
+    )
+
+
+def _causal_regime_probability(
+    signal: pd.Series,
+    lookback: int = 250,
+    min_periods: int = 100,
+) -> pd.Series:
+    """
+    Convert a regime-strength signal into a causal rolling probability proxy.
+
+    This is intentionally not an HMM: it uses only past rolling median/IQR and
+    can live safely in the feature matrix. A true HMM should be fit inside each
+    train fold and then applied to the corresponding test fold.
+    """
+    median = signal.rolling(lookback, min_periods=min_periods).median()
+    q75 = signal.rolling(lookback, min_periods=min_periods).quantile(0.75)
+    q25 = signal.rolling(lookback, min_periods=min_periods).quantile(0.25)
+    scale = (q75 - q25).replace(0, np.nan)
+    z_score = ((signal - median) / scale).clip(-20, 20)
+    return 1.0 / (1.0 + np.exp(-z_score))
+
+
 def feature_engineering_h1(df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute H1 features using ONLY data at time ``t`` and earlier.
@@ -164,9 +285,11 @@ def feature_engineering_h1(df: pd.DataFrame) -> pd.DataFrame:
     Feature groups:
     - Trend: distances from SMA(20/50/200) in ATR units, plus 20-bar regression slope
     - Momentum: RSI(14), 5/10/20-bar price change in ATR units
-    - Volatility: ATR(14), ATR(20), Bollinger width
+    - Memory: fixed-d fractional differentiation using a preselected d=0.4
+    - Volatility: ATR(14), ATR(20), Bollinger width, volatility-of-volatility
+    - Structural breaks: symmetric CUSUM events with ATR-scaled thresholds
     - Market structure: close position in 20-bar range, range size in ATR units
-    - Regime: ADX(14)
+    - Regime: ADX(14), causal continuous high-vol/trend probability proxies
     - Time: hour of day, day of week
     """
     out = _validate_h1_frame(df)
@@ -189,16 +312,27 @@ def feature_engineering_h1(df: pd.DataFrame) -> pd.DataFrame:
     out["roc_5_atr"] = (close - close.shift(5)) / atr_safe
     out["roc_10_atr"] = (close - close.shift(10)) / atr_safe
     out["roc_20_atr"] = (close - close.shift(20)) / atr_safe
+    fracdiff_close = _fractional_diff_fixed_width(close, d=0.4)
+    out["fracdiff_close_d04_atr"] = fracdiff_close / atr_safe
+    out["fracdiff_slope_5"] = fracdiff_close.diff(5) / atr_safe
 
     sma20 = out["sma_20"]
     std20 = close.rolling(20, min_periods=20).std(ddof=0)
     out["bb_width_20"] = std20 / sma20.replace(0, np.nan)
+    out["atr_20_vov_20"] = out["atr_20"].pct_change().rolling(20, min_periods=20).std()
+    out["bb_width_vov_20"] = out["bb_width_20"].pct_change().rolling(20, min_periods=20).std()
 
     rolling_high_20 = out["high"].rolling(20, min_periods=20).max()
     rolling_low_20 = out["low"].rolling(20, min_periods=20).min()
     range_20 = (rolling_high_20 - rolling_low_20).replace(0, np.nan)
     out["close_range_pos_20"] = (close - rolling_low_20) / range_20
     out["range_20_atr"] = range_20 / atr_safe
+
+    cusum = _symmetric_cusum_events(close, threshold=out["atr_20"] * 1.5)
+    out = out.join(cusum)
+    out["bars_since_cusum"] = out["bars_since_cusum"].fillna(10_000.0).clip(upper=10_000.0)
+    out["prob_high_vol_regime"] = _causal_regime_probability(out["atr_20_vov_20"])
+    out["prob_trend_regime"] = _causal_regime_probability(out["adx_14"])
 
     out["hour_of_day"] = out.index.hour.astype(int)
     out["day_of_week"] = out.index.dayofweek.astype(int)

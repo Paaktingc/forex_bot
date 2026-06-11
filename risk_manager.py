@@ -65,6 +65,28 @@ class RiskManager:
     # Public methods
     # ------------------------------------------------------------------
 
+    def current_drawdown_pct(self, current_equity: float) -> float:
+        """Fractional drawdown from starting balance (0.0 when in profit)."""
+        if self.starting_balance <= 0:
+            return 0.0
+        return max(
+            (self.starting_balance - current_equity) / self.starting_balance, 0.0
+        )
+
+    def _drawdown_size_multiplier(self, current_equity: float) -> float:
+        """
+        Circuit breaker sizing factor:
+          - full size below the warning threshold,
+          - half size once drawdown >= DRAWDOWN_WARNING_THRESHOLD (3.0%),
+          - zero (halt) once drawdown >= MAX_DRAWDOWN_LIMIT (4.5%).
+        """
+        dd_pct = self.current_drawdown_pct(current_equity)
+        if dd_pct >= config.MAX_DRAWDOWN_LIMIT:
+            return 0.0
+        if dd_pct >= config.DRAWDOWN_WARNING_THRESHOLD:
+            return 0.5
+        return 1.0
+
     def check_absolute_drawdown(self, current_equity: float) -> bool:
         """
         Returns False (stop trading) if absolute drawdown from starting_balance
@@ -76,19 +98,15 @@ class RiskManager:
         if self.starting_balance <= 0:
             return True
 
-        dd_pct = (self.starting_balance - current_equity) / self.starting_balance
+        dd_pct = self.current_drawdown_pct(current_equity)
 
-        if dd_pct >= 0.03:
+        if dd_pct >= config.DRAWDOWN_WARNING_THRESHOLD:
             logger.warning(
-                f"Drawdown WARNING: {dd_pct:.2%} "
-                f"(limit {config.MAX_DRAWDOWN_PCT:.2%})"
-            )
-        if dd_pct >= 0.04:
-            logger.critical(
-                f"Drawdown CRITICAL: {dd_pct:.2%} — approaching hard limit."
+                f"Drawdown WARNING: {dd_pct:.2%} — position size reduced 50% "
+                f"(hard limit {config.MAX_DRAWDOWN_LIMIT:.2%})"
             )
 
-        if dd_pct >= config.MAX_DRAWDOWN_PCT:
+        if dd_pct >= config.MAX_DRAWDOWN_LIMIT:
             logger.critical(
                 f"MAX DRAWDOWN HIT ({dd_pct:.2%}). Emergency closing all positions."
             )
@@ -159,6 +177,23 @@ class RiskManager:
         pip_value = 10.0  # per standard lot
 
         lot = risk_amount / (sl_pips * pip_value)
+
+        # Drawdown circuit breaker (The5ers protection):
+        #   >= warning threshold → halve size; >= hard limit → no new position.
+        size_mult = self._drawdown_size_multiplier(equity)
+        if size_mult == 0.0:
+            logger.critical(
+                "Drawdown circuit breaker: hard limit reached — sizing blocked, "
+                "returning 0."
+            )
+            return 0.0
+        if size_mult < 1.0:
+            logger.warning(
+                "Drawdown circuit breaker: reducing position size to %.0f%%.",
+                size_mult * 100,
+            )
+        lot *= size_mult
+
         lot = round(lot, 2)
         lot = max(0.01, min(lot, 5.0))
 

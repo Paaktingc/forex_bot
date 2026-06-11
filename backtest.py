@@ -41,6 +41,7 @@ PASS_CRITERIA = {
 }
 
 ENABLE_WALK_FORWARD = os.getenv("BACKTEST_FULL_VALIDATION", "0") == "1"
+ENABLE_MONTE_CARLO = os.getenv("BACKTEST_MONTE_CARLO", "0") == "1"
 DEFAULT_MAX_M15_ROWS = int(os.getenv("BACKTEST_MAX_M15_ROWS", "3000"))
 
 
@@ -592,6 +593,76 @@ class BacktestEngine:
         results.append(average_metrics)
         return results
 
+    def run_monte_carlo(self, n: int = 1000, seed: int | None = 42) -> dict:
+        """
+        Bootstrap Monte Carlo on the realized trade P&L sequence.
+
+        Resamples the per-trade P&L with replacement (same number of trades)
+        `n` times, rebuilds an equity curve for each draw, and records the
+        peak-to-trough max drawdown per iteration. This stress-tests how trade
+        order / sampling luck affects drawdown under the current sizing.
+
+        run() must be called first to populate self.trades.
+
+        NOTE: each resampled P&L embeds the lot size from the original backtest
+        path; the dynamic drawdown circuit breaker is NOT re-applied per draw,
+        so this assumes fixed per-trade position sizing.
+
+        Returns a dict: pct_under_5pct, dd_95th_pct, worst_dd_pct, mean_dd_pct,
+        n_iterations, n_trades.
+        """
+        pnls = np.array(
+            [float(trade["pnl_currency"]) for trade in self.trades], dtype=float
+        )
+        if pnls.size == 0:
+            logger.warning("run_monte_carlo: no trades to resample.")
+            return {
+                "pct_under_5pct": 0.0,
+                "dd_95th_pct": 0.0,
+                "worst_dd_pct": 0.0,
+                "mean_dd_pct": 0.0,
+                "n_iterations": 0,
+                "n_trades": 0,
+            }
+
+        rng = np.random.default_rng(seed)
+        m = pnls.size
+
+        # Resample with replacement → shape (n, m).
+        draws = rng.choice(pnls, size=(n, m), replace=True)
+
+        # Equity curve per iteration, anchored at starting_balance.
+        equity = self.starting_balance + np.cumsum(draws, axis=1)
+        equity = np.column_stack(
+            [np.full(n, self.starting_balance, dtype=float), equity]
+        )
+
+        peaks = np.maximum.accumulate(equity, axis=1)
+        drawdowns = np.where(peaks > 0, (peaks - equity) / peaks, 0.0)
+        max_dd_pct = drawdowns.max(axis=1) * 100.0
+
+        return {
+            "pct_under_5pct": float(np.mean(max_dd_pct < 5.0) * 100.0),
+            "dd_95th_pct": float(np.percentile(max_dd_pct, 95)),
+            "worst_dd_pct": float(max_dd_pct.max()),
+            "mean_dd_pct": float(max_dd_pct.mean()),
+            "n_iterations": int(n),
+            "n_trades": int(m),
+        }
+
+
+def _print_monte_carlo_block(result: dict) -> None:
+    print("\nMONTE CARLO (1,000× bootstrap on trade P&L)")
+    print("-" * 56)
+    print(f"Iterations:           {result['n_iterations']}")
+    print(f"Trades per iteration: {result['n_trades']}")
+    print(f"Runs with DD < 5%:    {result['pct_under_5pct']:.1f}%   TARGET: >95%")
+    print(f"95th percentile DD:   {result['dd_95th_pct']:.2f}%")
+    print(f"Worst-case DD:        {result['worst_dd_pct']:.2f}%")
+    print(f"Mean DD:              {result['mean_dd_pct']:.2f}%")
+    status = "PASS" if result["pct_under_5pct"] > 95.0 else "FAIL"
+    print(f"Monte Carlo target:   {status} (>95% of runs under 5%)")
+
 
 def main() -> None:
     logging.basicConfig(
@@ -668,6 +739,9 @@ def main() -> None:
         )
     else:
         print("\nWalk-forward validation skipped. Set BACKTEST_FULL_VALIDATION=1 to enable it.")
+
+    if ENABLE_MONTE_CARLO:
+        _print_monte_carlo_block(engine.run_monte_carlo(n=1000))
 
     _report_overall_status(metrics)
 

@@ -104,16 +104,19 @@ class TestCheckDailyLoss:
 
 class TestCalculateLotSize:
     def test_standard_calculation(self, rm):
-        # equity=10000, risk=75, sl_pips=50, pip_val=10 → lot=0.15
+        # equity=10000, risk=39 (0.39%), sl_pips=50, pip_val=10 → lot=0.078 → 0.08
         lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD")
-        assert lot == 0.15
+        assert lot == 0.08
 
     def test_entry_equals_sl_returns_zero(self, rm):
         lot = rm.calculate_lot_size(10_000, 1.1000, 1.1000, "EURUSD")
         assert lot == 0.0
 
-    def test_minimum_clamp(self, rm):
-        # Tiny equity / wide SL → lot would be near-zero → clamped to 0.01
+    def test_minimum_clamp(self):
+        # Tiny equity / wide SL → lot would be near-zero → clamped to 0.01.
+        # Use a matching starting balance so the drawdown circuit breaker
+        # (which keys off equity vs. starting balance) stays inactive.
+        rm = RiskManager(10)
         lot = rm.calculate_lot_size(10, 1.0000, 1.5000, "EURUSD")
         assert lot == 0.01
 
@@ -122,15 +125,18 @@ class TestCalculateLotSize:
         lot = rm.calculate_lot_size(10_000_000, 1.0999, 1.1000, "EURUSD")
         assert lot == 5.0
 
-    def test_martingale_prevention(self, rm):
-        # Simulate a loss: equity dropped since last trade
-        rm._last_lot_size = 0.10
-        rm._last_equity_at_lot = 10_000.0   # previous equity was higher
+    def test_martingale_prevention(self):
+        # Keep the equity decline within the circuit-breaker warning threshold
+        # so this test isolates the martingale cap, not the drawdown breaker.
+        rm = RiskManager(9_600)
+        rm._last_lot_size = 0.05
+        rm._last_equity_at_lot = 9_600.0   # previous equity was higher
 
-        # New equity is lower, so we calculate a size – but it must not exceed 0.10
+        # New equity is lower (≈1% DD), so we calculate a size – but it must
+        # not exceed the previous lot of 0.05.
         lot = rm.calculate_lot_size(9_500, 1.0950, 1.1000, "EURUSD")
-        # risk=71.25, sl_pips=50 → uncapped lot=0.14 → capped to 0.10
-        assert lot <= 0.10
+        # uncapped ≈ 0.07 > previous 0.05 → capped to 0.05
+        assert lot <= 0.05
 
     def test_no_martingale_cap_on_profit(self, rm):
         # Equity grew since last trade → no cap applied
@@ -138,8 +144,44 @@ class TestCalculateLotSize:
         rm._last_equity_at_lot = 9_000.0   # previous equity was lower
 
         lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD")
-        # uncapped = 0.15; previous lot was 0.05 (smaller) → cap doesn't kick in
-        assert lot == 0.15
+        # uncapped = 0.08; previous lot was 0.05 (smaller) → cap doesn't kick in
+        assert lot == 0.08
+
+
+# ---------------------------------------------------------------------------
+# Drawdown circuit breaker
+# ---------------------------------------------------------------------------
+
+class TestDrawdownCircuitBreaker:
+    _entry = 1.1000
+    _sl = 1.0950   # 50 pips
+
+    def test_full_size_below_warning(self, rm):
+        # 2.9% drawdown → below 3% warning → full size, multiplier 1.0
+        equity = BALANCE * (1 - 0.029)
+        assert rm._drawdown_size_multiplier(equity) == 1.0
+
+    def test_half_size_at_warning(self, rm):
+        # Exactly 3.0% drawdown → halve position size
+        equity = BALANCE * (1 - config.DRAWDOWN_WARNING_THRESHOLD)
+        assert rm._drawdown_size_multiplier(equity) == 0.5
+
+        full = rm.calculate_lot_size(BALANCE, self._sl, self._entry, "EURUSD")
+        rm._last_lot_size = 0.0   # clear martingale state between calls
+        reduced = rm.calculate_lot_size(equity, self._sl, self._entry, "EURUSD")
+        assert reduced < full
+
+    def test_halt_at_hard_limit(self, rm):
+        # Exactly 4.5% drawdown → sizing blocked, returns 0
+        equity = BALANCE * (1 - config.MAX_DRAWDOWN_LIMIT)
+        assert rm._drawdown_size_multiplier(equity) == 0.0
+        lot = rm.calculate_lot_size(equity, self._sl, self._entry, "EURUSD")
+        assert lot == 0.0
+
+    def test_no_drawdown_in_profit(self, rm):
+        # Equity above starting balance → zero drawdown, full size
+        assert rm.current_drawdown_pct(BALANCE + 500) == 0.0
+        assert rm._drawdown_size_multiplier(BALANCE + 500) == 1.0
 
 
 # ---------------------------------------------------------------------------

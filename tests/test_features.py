@@ -9,10 +9,12 @@ from unittest.mock import patch
 # But the project already has an env for it, let's assume it imports successfully or we can patch if needed.
 # Let's just import normally first.
 from features import (
+    META_FEATURE_COLS,
     compute_indicators,
     compute_session_features,
     add_h1_trend,
     build_feature_matrix,
+    feature_engineering_h1,
     get_live_features,
     FEATURE_COLS
 )
@@ -105,6 +107,55 @@ def test_build_feature_matrix(sample_m15, sample_h1):
     # No raw OHLCV
     for raw in ['open', 'high', 'low', 'close', 'tick_volume', 'volume']:
         assert raw not in df_feats.columns
+
+
+def test_feature_engineering_h1_includes_structural_features():
+    df_h1 = generate_synthetic_data(600, freq="1h")
+    df_feats = feature_engineering_h1(df_h1)
+
+    expected_cols = [
+        "fracdiff_close_d04_atr",
+        "fracdiff_slope_5",
+        "atr_20_vov_20",
+        "bb_width_vov_20",
+        "cusum_break",
+        "cusum_direction",
+        "bars_since_cusum",
+        "prob_high_vol_regime",
+        "prob_trend_regime",
+    ]
+    assert not df_feats.empty
+    for column in expected_cols:
+        assert column in df_feats.columns
+        assert column in META_FEATURE_COLS
+    assert df_feats[META_FEATURE_COLS].isna().sum().sum() == 0
+    assert np.isfinite(df_feats[META_FEATURE_COLS].to_numpy(dtype=float)).all()
+    assert set(df_feats["cusum_break"].unique()).issubset({0, 1})
+    assert set(df_feats["cusum_direction"].unique()).issubset({-1, 0, 1})
+    assert df_feats["prob_high_vol_regime"].between(0, 1).all()
+    assert df_feats["prob_trend_regime"].between(0, 1).all()
+
+
+def test_feature_engineering_h1_structural_features_are_causal():
+    df_h1 = generate_synthetic_data(620, freq="1h")
+    split_pos = 520
+    truncated = df_h1.iloc[:split_pos].copy()
+    future_mutated = df_h1.copy()
+    future_mutated.iloc[split_pos:, future_mutated.columns.get_loc("close")] *= 1.10
+    future_mutated.iloc[split_pos:, future_mutated.columns.get_loc("high")] *= 1.10
+    future_mutated.iloc[split_pos:, future_mutated.columns.get_loc("low")] *= 1.10
+    future_mutated.iloc[split_pos:, future_mutated.columns.get_loc("open")] *= 1.10
+
+    baseline = feature_engineering_h1(truncated)
+    mutated = feature_engineering_h1(future_mutated).reindex(baseline.index)
+
+    pd.testing.assert_frame_equal(
+        baseline[META_FEATURE_COLS],
+        mutated[META_FEATURE_COLS],
+        check_dtype=False,
+        rtol=1e-12,
+        atol=1e-12,
+    )
 
 @patch('features.get_ohlcv')
 def test_get_live_features(mock_get_hist, sample_m15, sample_h1):

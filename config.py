@@ -33,9 +33,11 @@ CTRADER_UNITS_PER_LOT = 100_000
 
 # Risk Management & The5ers Hard Rules
 STARTING_BALANCE = None
-MAX_DRAWDOWN_PCT = 0.045
+MAX_DRAWDOWN_LIMIT = 0.045            # Hard drawdown limit → halt all new trades
+DRAWDOWN_WARNING_THRESHOLD = 0.030   # Soft threshold → reduce position size 50%
+MAX_DRAWDOWN_PCT = MAX_DRAWDOWN_LIMIT  # Backward-compat alias (legacy refs + tests)
 DAILY_LOSS_PCT = 0.040
-RISK_PER_TRADE_PCT = 0.0075
+RISK_PER_TRADE_PCT = 0.0039          # was 0.0075; ×0.52 to target ~4% max drawdown
 
 # Stop Loss / Take Profit (ATR Multipliers)
 SL_ATR_MULT = 1.0
