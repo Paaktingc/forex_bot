@@ -340,6 +340,51 @@ def feature_engineering_h1(df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(subset=META_FEATURE_COLS).copy()
     return out
 
+def compute_regime_indicators_h1(df_h1: pd.DataFrame) -> pd.DataFrame:
+    """
+    H1 indicators for the rules-based regime filter:
+    EMA(50), EMA(200), ADX(14), ATR(14). Uses only completed-bar data.
+    """
+    out = df_h1.copy()
+    if "tick_volume" in out.columns and "volume" not in out.columns:
+        out["volume"] = out["tick_volume"]
+    close = out["close"]
+    out["ema_50"] = _ema(close, 50)
+    out["ema_200"] = _ema(close, 200)
+    out["adx_14"] = _adx(out, 14)
+    out["atr_14"] = _atr(out, 14)
+    return out
+
+
+def compute_entry_indicators_m15(df_m15: pd.DataFrame) -> pd.DataFrame:
+    """
+    M15 indicators for the rules-based entry trigger:
+    EMA(20), RSI(14), ATR(14). Uses only completed-bar data.
+    """
+    out = df_m15.copy()
+    if "tick_volume" in out.columns and "volume" not in out.columns:
+        out["volume"] = out["tick_volume"]
+    close = out["close"]
+    out["ema_20"] = _ema(close, 20)
+    out["rsi_14"] = _rsi_wilder(close, 14)
+    out["atr_14"] = _atr(out, 14)
+    return out
+
+
+def rolling_swing_levels(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """
+    Rolling swing extremes over the trailing ``window`` completed bars:
+    swing_high = max(high), swing_low = min(low). Causal (no future bars).
+    """
+    return pd.DataFrame(
+        {
+            "swing_high": df["high"].rolling(window, min_periods=window).max(),
+            "swing_low": df["low"].rolling(window, min_periods=window).min(),
+        },
+        index=df.index,
+    )
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Computes technical indicators using pandas/numpy only.
