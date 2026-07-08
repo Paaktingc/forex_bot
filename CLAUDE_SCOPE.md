@@ -1,25 +1,28 @@
 # forex_bot Repository Scope
 
 ## Purpose
-A fully automated Forex machine learning trading system built for EURUSD. It supports both live execution and research/backtesting, with broker abstraction for MetaTrader 5 (MT5) and cTrader Open API.
+A fully automated RULES-FIRST forex trading system built for EURUSD, targeted at The5ers Bootcamp ($20K plan; +6% per step, −5% static max loss, −3% self-imposed kill switch). The strategy is deterministic (`strategy.py`); the ML model survives only as an optional veto. Supports live execution (demo only) and research/backtesting, with broker abstraction for MetaTrader 5 (MT5) and cTrader Open API.
 
 ## Key Components
 
 ### Live Trading
 - `main.py`
-  - Live trading loop on 15-minute candles
-  - Loads model and label encoder
-  - Connects to configured broker
-  - Applies risk and news filters
-  - Generates live features and predicts a buy/sell/hold signal
-  - Sizes risk, calculates SL/TP, and places orders
-  - Supports dry-run mode
+  - Live trading loop on 15-minute candles (dry-run supported)
+  - Flow: strategy candidate → session/news/spread/volatility filters →
+    optional MetaVeto (block-only) → RiskManager → execution
+  - Per-candle position management: breakeven at +1R, flatten before major news
+- `strategy.py`
+  - Rules signal engine: H1 EMA50/EMA200 + ADX regime, M15 EMA20-pullback /
+    H1-swing-retracement entry with RSI(14) 50-recross trigger
+  - Spread / volatility / DST-aware London session filters
 
 ### Backtesting & Research
 - `backtest.py`
-  - Historical backtesting engine
-  - Uses M15/H1 data, feature matrices, model inference, trade simulation
-  - Computes performance metrics and The5ers-style pass/fail criteria
+  - `RulesBacktestEngine`: rules-strategy simulation with conservative costs
+    and live pacing gates; `python backtest.py --go-no-go` prints the
+    GO/NO-GO verdict (backtest + walk-forward + Monte Carlo)
+  - Legacy model-driven `BacktestEngine` retained for research
+    (`--legacy-model`)
 - `run_pipeline.py`
   - Research/meta-labeling pipeline
   - Loads raw EURUSD data, resamples to H1, engineers features
@@ -28,10 +31,11 @@ A fully automated Forex machine learning trading system built for EURUSD. It sup
 
 ### Model Training / Inference
 - `model.py`
+  - `MetaVeto`: the XGBoost model demoted to a blocking-only filter on rules
+    candidates (off by default via `USE_META_VETO`); it can never create trades
   - XGBoost classifier training with time-series cross-validation
   - Label encoder and optional class-weighting
   - Model persistence to `models/model.pkl`
-  - Live prediction helper functions
 
 ### Data Handling
 - `data_feed.py`
@@ -47,14 +51,24 @@ A fully automated Forex machine learning trading system built for EURUSD. It sup
 
 ### Execution and Risk
 - `execution.py`
-  - Order placement and closing
+  - Order placement and closing (market orders only; every order must carry
+    a broker-visible SL — rejected here otherwise)
+  - Rate-limited SL modification and once-per-ticket breakeven moves
   - Throttles orders and handles MT5/cTrader execution
 - `risk_manager.py`
-  - The5ers-hard risk rules
-  - Absolute drawdown, daily loss, rollover window, max open trades
-  - ATR-based lot sizing and SL/TP calculation
+  - The5ers Bootcamp rules: −3% kill switch (flatten + disk-persisted
+    disabled flag, manual re-arm), −5% official backstop, weekly stop
+    (−1.5% / 5 consecutive losses), daily stop (−0.75% / 2 trades /
+    2 consecutive losses), server-time resets, inactivity heartbeat
+  - 0.3% risk sizing (lots floored to 0.01), SL 1.5×ATR beyond the pullback
+    swing clamped to 8–25 pips (skip outside clamp), TP = 2R
 - `news_filter.py`
-  - News window blocking logic
+  - Tiered news blackouts (±30 min high impact; ±60 min + flatten 15 min
+    before NFP/US CPI/FOMC/ECB); fails closed when the calendar is
+    unavailable or empty
+- `monte_carlo_dd.py`
+  - Bootcamp step simulator (+6% pass / −5% fail / −3% kill) and
+    block-bootstrap Monte Carlo used by the GO/NO-GO verdict
 
 ### Broker Abstraction
 - `brokers/`
