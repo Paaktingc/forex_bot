@@ -464,6 +464,45 @@ def log_exit(ticket: int, exit_price: float, exit_reason: str) -> None:
         logger.error(f"Failed to log exit for trade {ticket}: {exc}")
 
 
+def get_closed_trades() -> list[tuple[datetime, str]]:
+    """
+    Returns (exit_time, result) tuples for closed trades in exit-time order.
+    Used by RiskManager to rebuild consecutive-loss counters.
+    """
+    try:
+        df = _read_journal()
+        closed = _closed_trades(df)
+        if closed.empty:
+            return []
+        exit_times = pd.to_datetime(closed["exit_time"], utc=True, errors="coerce")
+        out = [
+            (ts.to_pydatetime(), str(result).upper())
+            for ts, result in zip(exit_times, closed["result"], strict=True)
+            if not pd.isna(ts) and str(result).upper() in {"WIN", "LOSS", "BE"}
+        ]
+        out.sort(key=lambda item: item[0])
+        return out
+    except Exception as exc:
+        logger.error(f"get_closed_trades failed: {exc}")
+        return []
+
+
+def get_entry_times() -> list[datetime]:
+    """
+    Returns entry timestamps for ALL journalled trades (open and closed).
+    Used by RiskManager for the trades-per-day cap and inactivity heartbeat.
+    """
+    try:
+        df = _read_journal()
+        if df.empty:
+            return []
+        timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        return [ts.to_pydatetime() for ts in timestamps if not pd.isna(ts)]
+    except Exception as exc:
+        logger.error(f"get_entry_times failed: {exc}")
+        return []
+
+
 def get_daily_summary() -> dict[str, Any]:
     """
     Returns summary stats for trades opened today in UTC.

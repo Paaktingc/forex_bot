@@ -184,7 +184,11 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
         tick = data_feed.get_latest_tick(SYMBOL)
         entry = tick["ask"] if signal == 1 else tick["bid"]
 
-        sl, tp = state.risk.calculate_sl_tp(signal, entry, atr)
+        sl_tp = state.risk.calculate_sl_tp(signal, entry, atr)
+        if sl_tp is None:
+            logger.info("process_candle: SL outside clamp — skipping trade.")
+            return
+        sl, tp = sl_tp
         lot = state.risk.calculate_lot_size(equity, sl, entry, SYMBOL)
     except Exception as exc:
         logger.exception(f"process_candle: SL/TP/lot calculation failed: {exc}")

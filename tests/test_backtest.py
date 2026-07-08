@@ -92,15 +92,16 @@ def test_run_builds_features_with_strict_prefix_only(dummy_artifacts, monkeypatc
 @pytest.mark.parametrize(
     ("exit_bar", "bar_updates", "expected_reason", "expected_result"),
     [
+        # ATR = 10 pips → SL = 1.5×ATR = 15 pips below entry, TP = 2R = 30 pips above
         (
             102,
-            {"high": 1.1025, "low": 1.1005, "close": 1.1010},
+            {"high": 1.1035, "low": 1.1005, "close": 1.1010},
             "TP",
             "WIN",
         ),
         (
             102,
-            {"high": 1.1005, "low": 1.0990, "close": 1.0995},
+            {"high": 1.1005, "low": 1.0985, "close": 1.0990},
             "SL",
             "LOSS",
         ),

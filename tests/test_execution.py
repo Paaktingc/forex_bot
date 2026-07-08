@@ -182,7 +182,7 @@ class TestPlaceOrder:
 
         sent_req = mock_mt5.order_send.call_args[0][0]
         assert sent_req["magic"]   == config.BOT_MAGIC_NUMBER
-        assert sent_req["comment"] == "ML_BOT_V1"
+        assert sent_req["comment"] == config.BOT_LABEL
         assert sent_req["deviation"] == 10
 
     @patch("execution.time.sleep")

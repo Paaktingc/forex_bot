@@ -60,8 +60,8 @@ def run_backtest(
     For each bar *i* the model predicts on the features at bar *i*.
     If a valid signal fires (confidence >= MIN_CONFIDENCE):
         • Entry  = close[i]
-        • SL     = entry ∓ SL_ATR_MULT  * atr_14[i]
-        • TP     = entry ± TP_ATR_MULT  * atr_14[i]
+        • SL     = entry ∓ SL_ATR_MULT * atr_14[i]
+        • TP     = entry ± TP_R * (SL_ATR_MULT * atr_14[i])   (R multiple of SL distance)
     The trade is held until SL, TP, or end of data is reached.
 
     Args:
@@ -107,10 +107,10 @@ def run_backtest(
 
         if signal == 1:   # BUY
             sl = entry - config.SL_ATR_MULT * atr
-            tp = entry + config.TP_ATR_MULT * atr
+            tp = entry + config.TP_R * (config.SL_ATR_MULT * atr)
         elif signal == -1:  # SELL
             sl = entry + config.SL_ATR_MULT * atr
-            tp = entry - config.TP_ATR_MULT * atr
+            tp = entry - config.TP_R * (config.SL_ATR_MULT * atr)
         else:
             i += 1
             continue

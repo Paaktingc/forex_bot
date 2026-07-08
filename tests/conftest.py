@@ -25,3 +25,16 @@ class MockMT5:
 sys.modules['MetaTrader5'] = MockMT5()
 
 # Real ML libraries will be used for testing.
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_risk_flag_files(tmp_path, monkeypatch):
+    """Keep RiskManager persistence files out of the real logs/ directory."""
+    import config
+
+    monkeypatch.setattr(
+        config, "RISK_DISABLED_FLAG_PATH", str(tmp_path / "trading_disabled.json")
+    )
+    monkeypatch.setattr(config, "RISK_STATE_PATH", str(tmp_path / "risk_state.json"))

@@ -325,7 +325,10 @@ class BacktestEngine:
         raw_open = float(self.df["open"].iloc[bar_idx])
         entry_price = raw_open + ENTRY_SPREAD if signal == 1 else raw_open - ENTRY_SPREAD
         entry_price = round(float(entry_price), 5)
-        sl, tp = self.risk_manager.calculate_sl_tp(signal, entry_price, float(atr))
+        sl_tp = self.risk_manager.calculate_sl_tp(signal, entry_price, float(atr))
+        if sl_tp is None:
+            return None
+        sl, tp = sl_tp
         lot = self.risk_manager.calculate_lot_size(self.balance, sl, entry_price, config.SYMBOL)
         if lot <= 0:
             return None
