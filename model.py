@@ -311,13 +311,70 @@ def evaluate_model(
     return results
 
 
+class MetaVeto:
+    """
+    The XGBoost model demoted to a VETO on rules-generated candidates.
+
+    It may only BLOCK trades, never create them: `allow()` returns False only
+    when the model predicts the OPPOSITE direction of the candidate with
+    confidence >= META_VETO_THRESHOLD. Any model failure fails OPEN (the
+    rules candidate stands) — the veto is an optional extra filter, off by
+    default (config.USE_META_VETO = False).
+    """
+
+    def __init__(
+        self,
+        model: ClassifierType,
+        label_encoder: LabelEncoder,
+        threshold: float | None = None,
+    ) -> None:
+        self.model = model
+        self.label_encoder = label_encoder
+        self.threshold = threshold if threshold is not None else config.META_VETO_THRESHOLD
+
+    @classmethod
+    def load(cls) -> "MetaVeto":
+        model, le = load_model()
+        return cls(model, le)
+
+    def allow(self, direction: int, X_live: pd.DataFrame) -> bool:
+        """
+        Args:
+            direction: rules candidate direction (1 buy, -1 sell).
+            X_live:    single-row feature frame for the candidate bar.
+        Returns:
+            False only on a confident opposite-direction prediction.
+        """
+        if direction not in (1, -1):
+            return False
+        try:
+            proba = self.model.predict_proba(X_live)[0]
+            predicted_encoded = int(np.argmax(proba))
+            predicted = int(self.label_encoder.inverse_transform([predicted_encoded])[0])
+            confidence = float(np.max(proba))
+        except Exception as exc:
+            logger.warning("MetaVeto.allow: model failed (%s) — failing open.", exc)
+            return True
+
+        if predicted == -direction and confidence >= self.threshold:
+            logger.info(
+                "MetaVeto BLOCKED candidate direction=%s (model predicts %s "
+                "at %.2f >= %.2f).",
+                direction, predicted, confidence, self.threshold,
+            )
+            return False
+        return True
+
+
 def predict_signal(
     model: ClassifierType,
     le: LabelEncoder,
     X_live: pd.DataFrame,
 ) -> Tuple[int, float]:
     """
-    Predicts a trading signal from live feature data.
+    DEPRECATED for live trading: ML-driven entries are retired. The live loop
+    uses strategy.py for candidates and MetaVeto (above) as an optional block.
+    Kept for the legacy research/backtest report paths only.
     """
     try:
         proba = model.predict_proba(X_live)[0]

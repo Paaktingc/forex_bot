@@ -69,6 +69,7 @@ class Candidate:
     signal_time: pd.Timestamp            # close time of the trigger M15 bar
     swing_price: float                   # pullback extreme (SL anchor)
     atr: float                           # M15 ATR(14) at signal time
+    atr_median: float | None = None      # trailing 20-day ATR median (vol filter)
     reason: str = "H1 regime + M15 pullback"
 
 
@@ -241,11 +242,13 @@ def generate_candidate(
     if not np.isfinite(last["swing_price"]) or not np.isfinite(last["atr_14"]):
         return None
 
+    atr_median = float(last["atr_median"]) if np.isfinite(last["atr_median"]) else None
     return Candidate(
         direction=int(last["signal"]),
         signal_time=frame.index[-1],
         swing_price=float(last["swing_price"]),
         atr=float(last["atr_14"]),
+        atr_median=atr_median,
     )
 
 
