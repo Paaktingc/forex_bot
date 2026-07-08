@@ -10,9 +10,11 @@ Enforces The5ers hard risk rules via RiskManager class:
 """
 
 import logging
+import math
 from datetime import datetime, timezone
 
 import config
+from symbol_specs import get_symbol_spec
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,7 @@ class RiskManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _maybe_reset_daily(self) -> None:
+    def _maybe_reset_daily(self, current_equity: float) -> None:
         """
         Resets daily_start_balance and halted_today when a new UTC day starts.
         """
@@ -53,12 +55,10 @@ class RiskManager:
         if now.date() > self.daily_start_time.date():
             logger.info(
                 f"New UTC day detected. Resetting daily balance from "
-                f"{self.daily_start_balance} to current snapshot."
+                f"{self.daily_start_balance} to current equity {current_equity}."
             )
-            # We don't have current equity here, so we reset the timer and flag;
-            # daily_start_balance will be refreshed on the first can_trade call
-            # that supplies current_equity.
             self.daily_start_time = now
+            self.daily_start_balance = current_equity
             self.halted_today = False
 
     # ------------------------------------------------------------------
@@ -122,14 +122,7 @@ class RiskManager:
         Auto-resets at UTC midnight, then returns False if the daily loss
         >= DAILY_LOSS_PCT. Sets self.halted_today = True on breach.
         """
-        self._maybe_reset_daily()
-
-        # First call of a new day: anchor today's start balance
-        if self.daily_start_time.date() == datetime.now(UTC).date() and \
-                self.daily_start_balance == self.starting_balance and \
-                current_equity != self.starting_balance:
-            # Allow this to remain as-is; daily_start_balance was set at __init__
-            pass
+        self._maybe_reset_daily(current_equity)
 
         if self.daily_start_balance <= 0:
             return True
@@ -155,26 +148,36 @@ class RiskManager:
         equity: float,
         sl_price: float,
         entry_price: float,
-        symbol: str,    # reserved for future per-symbol pip value lookup
+        symbol: str,
     ) -> float:
         """
         Risk-based position sizing.
 
         risk_amount = equity * RISK_PER_TRADE_PCT
-        sl_pips     = abs(entry - sl) / 0.0001
-        pip_value   = 10.0  (per standard lot for major pairs)
+        sl_pips     = abs(entry - sl) / symbol pip size
+        pip_value   = symbol pip value per standard lot
         lot         = risk_amount / (sl_pips * pip_value)
 
-        Clamped to [0.01, 5.0] and rounded to 2 dp.
+        Floored to the broker lot step and clamped to max lot.
+        Returns 0.0 if the calculated size is invalid or below min lot.
         Martingale prevention: never exceed the lot size used before a loss.
         """
-        if entry_price == sl_price:
-            logger.error("calculate_lot_size: entry == sl, returning 0.")
+        spec = get_symbol_spec(symbol)
+        if spec is None:
+            logger.error(f"calculate_lot_size: unsupported symbol {symbol}, returning 0.")
+            return 0.0
+
+        if equity <= 0 or entry_price == sl_price:
+            logger.error("calculate_lot_size: invalid equity or SL distance, returning 0.")
             return 0.0
 
         risk_amount = equity * config.RISK_PER_TRADE_PCT
-        sl_pips = abs(entry_price - sl_price) / 0.0001
-        pip_value = 10.0  # per standard lot
+        sl_pips = abs(entry_price - sl_price) / spec.pip_size
+        pip_value = spec.pip_value_per_standard_lot
+
+        if risk_amount <= 0 or sl_pips <= 0 or pip_value <= 0:
+            logger.error("calculate_lot_size: invalid risk inputs, returning 0.")
+            return 0.0
 
         lot = risk_amount / (sl_pips * pip_value)
 
@@ -194,8 +197,18 @@ class RiskManager:
             )
         lot *= size_mult
 
+        if lot < spec.min_lot:
+            logger.warning(
+                f"calculate_lot_size: calculated lot {lot:.4f} below "
+                f"minimum {spec.min_lot}, returning 0."
+            )
+            return 0.0
+
+        lot = min(lot, spec.max_lot)
+        lot = math.floor((lot / spec.lot_step) + 1e-12) * spec.lot_step
         lot = round(lot, 2)
-        lot = max(0.01, min(lot, 5.0))
+        if lot < spec.min_lot:
+            return 0.0
 
         # Martingale prevention:
         # If equity has declined since last trade, cap lot at previous lot size.
@@ -243,6 +256,8 @@ class RiskManager:
           d. Max open trades
         Returns (True, "OK") only when all checks pass.
         """
+        self._maybe_reset_daily(current_equity)
+
         if not self.check_absolute_drawdown(current_equity):
             return False, "MAX DRAWDOWN HIT"
 

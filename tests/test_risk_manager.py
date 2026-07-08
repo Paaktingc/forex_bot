@@ -82,20 +82,37 @@ class TestCheckDailyLoss:
         # Even if equity recovers, trading stays blocked for the day
         assert rm.check_daily_loss(BALANCE + 500) is False
 
-    def test_midnight_reset_clears_halt(self, rm):
+    def test_same_day_does_not_clear_halt(self, rm):
         rm.halted_today = True
-        # Simulate daily_start_time being yesterday
+        assert rm.check_daily_loss(BALANCE + 500) is False
+        assert rm.halted_today is True
+
+    def test_new_utc_day_clears_halt_on_can_trade(self, rm):
+        rm.halted_today = True
         rm.daily_start_time = datetime.now(UTC) - timedelta(days=1)
-        # First call should reset halted_today
-        rm._maybe_reset_daily()
+
+        with patch("risk_manager.is_rollover_window", return_value=False):
+            ok, msg = rm.can_trade(BALANCE, 0)
+
+        assert ok is True
+        assert msg == "OK"
         assert rm.halted_today is False
 
     def test_midnight_reset_updates_start_time(self, rm):
         old_date = datetime.now(UTC).date() - timedelta(days=1)
         rm.daily_start_time = datetime(old_date.year, old_date.month, old_date.day,
                                        tzinfo=UTC)
-        rm._maybe_reset_daily()
+        rm._maybe_reset_daily(BALANCE)
         assert rm.daily_start_time.date() == datetime.now(UTC).date()
+
+    def test_new_day_start_balance_anchors_to_current_equity(self, rm):
+        rm.halted_today = True
+        rm.daily_start_balance = BALANCE
+        rm.daily_start_time = datetime.now(UTC) - timedelta(days=1)
+
+        assert rm.check_daily_loss(9_500.0) is True
+        assert rm.halted_today is False
+        assert rm.daily_start_balance == 9_500.0
 
 
 # ---------------------------------------------------------------------------
@@ -104,26 +121,35 @@ class TestCheckDailyLoss:
 
 class TestCalculateLotSize:
     def test_standard_calculation(self, rm):
-        # equity=10000, risk=39 (0.39%), sl_pips=50, pip_val=10 → lot=0.078 → 0.08
+        # equity=10000, risk=39 (0.39%), sl_pips=50, pip_val=10 -> lot=0.078 -> 0.07
         lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD")
-        assert lot == 0.08
+        assert lot == 0.07
+
+    def test_lot_size_floors_to_broker_step(self, rm):
+        # raw lot is about 0.147, so conservative step rounding floors to 0.14.
+        lot = rm.calculate_lot_size(10_000, 1.09735, 1.1000, "EURUSD")
+        assert lot == 0.14
 
     def test_entry_equals_sl_returns_zero(self, rm):
         lot = rm.calculate_lot_size(10_000, 1.1000, 1.1000, "EURUSD")
         assert lot == 0.0
 
-    def test_minimum_clamp(self):
-        # Tiny equity / wide SL → lot would be near-zero → clamped to 0.01.
+    def test_no_forced_minimum_lot_when_risk_size_too_small(self):
+        # Tiny equity / wide SL -> lot would be near-zero, so block the trade.
         # Use a matching starting balance so the drawdown circuit breaker
         # (which keys off equity vs. starting balance) stays inactive.
         rm = RiskManager(10)
         lot = rm.calculate_lot_size(10, 1.0000, 1.5000, "EURUSD")
-        assert lot == 0.01
+        assert lot == 0.0
 
     def test_maximum_clamp(self, rm):
         # Massive equity / tiny SL → lot > 5.0 → clamped to 5.0
         lot = rm.calculate_lot_size(10_000_000, 1.0999, 1.1000, "EURUSD")
         assert lot == 5.0
+
+    def test_unsupported_symbol_returns_zero(self, rm):
+        lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "GBPUSD")
+        assert lot == 0.0
 
     def test_martingale_prevention(self):
         # Keep the equity decline within the circuit-breaker warning threshold
@@ -144,8 +170,8 @@ class TestCalculateLotSize:
         rm._last_equity_at_lot = 9_000.0   # previous equity was lower
 
         lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD")
-        # uncapped = 0.08; previous lot was 0.05 (smaller) → cap doesn't kick in
-        assert lot == 0.08
+        # uncapped floors to 0.07; previous lot was 0.05 (smaller), so no cap.
+        assert lot == 0.07
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from typing import Dict
 import config
 from brokers import get_broker
 from brokers.mt5_adapter import MT5BrokerAdapter
+from symbol_specs import get_pip_size
 
 try:
     import MetaTrader5 as mt5
@@ -139,7 +140,7 @@ def get_latest_tick(symbol: str) -> Dict[str, float]:
             
         ask = float(tick.ask)
         bid = float(tick.bid)
-        spread_pips = (ask - bid) / 0.00001
+        spread_pips = (ask - bid) / get_pip_size(symbol)
         
         logger.info(f"Fetched tick for {symbol}: Bid={bid}, Ask={ask}, Spread(pips)={spread_pips:.1f}")
         return {

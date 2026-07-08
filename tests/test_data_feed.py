@@ -15,6 +15,7 @@ from data_feed import (
     save_data,
     load_data
 )
+from symbol_specs import get_pip_size
 
 @patch('data_feed.mt5')
 @patch('data_feed.os.getenv')
@@ -88,8 +89,24 @@ def test_get_latest_tick_success(mock_mt5):
     result = get_latest_tick("EURUSD")
     assert result['ask'] == 1.10020
     assert result['bid'] == 1.10000
-    # Spread in pips (1.1002 - 1.1000) / 0.00001 = 20
-    assert pytest.approx(result['spread']) == 20.0
+    # Spread in pips (1.1002 - 1.1000) / 0.0001 = 2
+    assert pytest.approx(result['spread']) == 2.0
+
+@patch('data_feed.mt5')
+def test_get_latest_tick_jpy_pair_uses_jpy_pip_size(mock_mt5):
+    mock_tick = MagicMock()
+    mock_tick.ask = 150.020
+    mock_tick.bid = 150.000
+    mock_mt5.symbol_info_tick.return_value = mock_tick
+
+    result = get_latest_tick("USDJPY")
+    assert result['ask'] == 150.020
+    assert result['bid'] == 150.000
+    assert pytest.approx(result['spread']) == 2.0
+
+def test_pip_size_by_symbol():
+    assert get_pip_size("EURUSD") == 0.0001
+    assert get_pip_size("USDJPY") == 0.01
 
 @patch('data_feed.mt5')
 def test_get_account_info_success(mock_mt5):
