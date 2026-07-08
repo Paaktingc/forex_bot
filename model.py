@@ -39,6 +39,11 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 ClassifierType = Any
+
+# Single source of truth for reproducibility. Seeds XGBoost (random_state) and
+# the NumPy global RNG (set in train_model) so retraining reproduces bit-for-bit.
+RANDOM_SEED = 42
+
 TRAINING_PARAMS = {
     "n_estimators": 500,
     "max_depth": 3,
@@ -48,7 +53,7 @@ TRAINING_PARAMS = {
     "min_child_weight": 10,
     "gamma": 0.3,
     "eval_metric": "mlogloss",
-    "random_state": 42,
+    "random_state": RANDOM_SEED,
     "objective": "multi:softprob",
     "n_jobs": 4,
 }
@@ -223,6 +228,7 @@ def train_model(
     """
     Trains an XGBClassifier using walk-forward TimeSeriesSplit (never shuffled).
     """
+    np.random.seed(RANDOM_SEED)  # pin global RNG for reproducible retraining
     label_encoder = _coerce_label_encoder(y, label_encoder)
     cv_result = _run_time_series_cv(
         X=X,

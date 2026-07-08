@@ -335,6 +335,24 @@ def main() -> None:
             flag = " ⚠️ INVESTIGATE" if abs(float(corr)) > 0.30 else ""
             print(f"  {column}: {float(corr):.4f}{flag}")
 
+    # Optional: cache the prepared model frame + selected features so downstream
+    # experiments (e.g. Lever-2 calibration/sizing) can iterate without re-prep.
+    if os.getenv("META_DUMP_CACHE") == "1":
+        import pickle
+        with open(os.path.join("data", "_lever2_cache.pkl"), "wb") as fh:
+            pickle.dump(
+                {
+                    "df_model": df_model,
+                    "selected_feature_cols": selected_feature_cols,
+                    "meta_config": META_CONFIG,
+                    "purge_gap": PURGE_GAP,
+                    "embargo_gap": EMBARGO_GAP,
+                    "thresholds": THRESHOLDS,
+                },
+                fh,
+            )
+        print("Cached prepared data to data/_lever2_cache.pkl")
+
     print("\nSTEP 11: Running meta-labeling walk-forward validation...")
     results = walk_forward_meta_labeling(
         df_model,
@@ -343,10 +361,23 @@ def main() -> None:
         test_months=1,
         purge_gap=PURGE_GAP,
         embargo_gap=EMBARGO_GAP,
-        risk_per_trade=0.01,
+        risk_per_trade=float(os.getenv("META_RISK_PER_TRADE", "0.005")),
         thresholds=THRESHOLDS,
         meta_config=META_CONFIG,
     )
+    # Persist per-trade P&L for the chosen threshold so downstream analysis
+    # (e.g. Monte Carlo tail-DD) is repeatable without re-running the pipeline.
+    dump_threshold = float(os.getenv("META_DUMP_THRESHOLD", "0.65"))
+    dump_trades = results.get("filtered_trades", {}).get(dump_threshold, [])
+    if dump_trades:
+        trades_df = pd.DataFrame(dump_trades).sort_values("datetime")
+        out_path = os.path.join("data", f"meta_trades_thr{dump_threshold:.2f}.csv")
+        trades_df.to_csv(out_path, index=False)
+        print(
+            f"\nPersisted {len(trades_df)} trades @ threshold {dump_threshold:.2f} "
+            f"(risk {os.getenv('META_RISK_PER_TRADE', '0.005')}) to {out_path}"
+        )
+
     results["regime_diagnostic"] = {
         "conditional_edge_found": bool(regime_results.get("conditional_edge_found", False)),
         "edge_bucket_count": len(regime_results.get("edge_buckets", [])),

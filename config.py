@@ -37,7 +37,10 @@ MAX_DRAWDOWN_LIMIT = 0.045            # Hard drawdown limit → halt all new tra
 DRAWDOWN_WARNING_THRESHOLD = 0.030   # Soft threshold → reduce position size 50%
 MAX_DRAWDOWN_PCT = MAX_DRAWDOWN_LIMIT  # Backward-compat alias (legacy refs + tests)
 DAILY_LOSS_PCT = 0.040
-RISK_PER_TRADE_PCT = 0.0039          # was 0.0075; ×0.52 to target ~4% max drawdown
+RISK_PER_TRADE_PCT = 0.005           # validated in walk-forward: META meta-label @ thr 0.65
+                                     # → OOS max DD 3.36% (< 4.5% limit). NOTE: only valid
+                                     # once the live model is the META model (run_pipeline.py);
+                                     # the current FEATURE_COLS model has no OOS edge.
 
 # Stop Loss / Take Profit (ATR Multipliers)
 SL_ATR_MULT = 1.0

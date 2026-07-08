@@ -121,9 +121,11 @@ class TestCheckDailyLoss:
 
 class TestCalculateLotSize:
     def test_standard_calculation(self, rm):
-        # equity=10000, risk=39 (0.39%), sl_pips=50, pip_val=10 -> lot=0.078 -> 0.07
+        # Derive expected from config so this survives risk-parameter retuning:
+        # lot = equity * RISK_PER_TRADE_PCT / (sl_pips * pip_value)
+        expected = round(10_000 * config.RISK_PER_TRADE_PCT / (50 * 10.0), 2)
         lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD")
-        assert lot == 0.07
+        assert lot == expected
 
     def test_lot_size_floors_to_broker_step(self, rm):
         # raw lot is about 0.147, so conservative step rounding floors to 0.14.
@@ -170,8 +172,11 @@ class TestCalculateLotSize:
         rm._last_equity_at_lot = 9_000.0   # previous equity was lower
 
         lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD")
-        # uncapped floors to 0.07; previous lot was 0.05 (smaller), so no cap.
-        assert lot == 0.07
+        # previous lot was 0.05 (smaller) → martingale cap doesn't kick in.
+        # Derive expected from config so it survives risk-parameter retuning.
+        expected = round(10_000 * config.RISK_PER_TRADE_PCT / (50 * 10.0), 2)
+        assert lot == expected
+        assert expected > 0.05  # guards the no-cap premise
 
 
 # ---------------------------------------------------------------------------

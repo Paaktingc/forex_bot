@@ -43,6 +43,10 @@ Thumbs.db
 *.joblib
 *.h5
 *.pth
+# Exception: track validated model artifacts + metadata for reproducibility
+!models/model.pkl
+!models/label_encoder.pkl
+!models/*.json
 
 # Generated files
 backtest_report.txt
@@ -53,3 +57,9 @@ logs/
 .env
 .env.local
 *.tmp
+
+# Machine-local Claude settings (do not publish)
+.claude/settings.local.json
+
+# Local model backups (keep validated artifacts only, see exception above)
+models/*.bak_*

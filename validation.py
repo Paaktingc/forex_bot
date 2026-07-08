@@ -20,6 +20,62 @@ from sklearn.metrics import accuracy_score
 
 from meta_labeling import train_meta_model
 
+
+def _fit_probability_calibrator(kind: str, train_prob: np.ndarray, y_train: np.ndarray):
+    """
+    Fit an in-sample probability calibrator on training predictions only.
+    Returns a callable mapping raw probabilities -> calibrated probabilities.
+    'none' is the identity (default; preserves legacy behaviour).
+    """
+    if kind == "none":
+        return lambda p: p
+    if kind == "isotonic":
+        from sklearn.isotonic import IsotonicRegression
+
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(train_prob, y_train)
+        return lambda p: iso.predict(p)
+    if kind == "sigmoid":
+        from sklearn.linear_model import LogisticRegression
+
+        lr = LogisticRegression(C=1e6, solver="lbfgs")
+        lr.fit(train_prob.reshape(-1, 1), y_train)
+        return lambda p: lr.predict_proba(np.asarray(p).reshape(-1, 1))[:, 1]
+    raise ValueError(f"Unknown probability_calibration: {kind}")
+
+
+def _position_confidence_multiplier(
+    mode: str,
+    probability: float,
+    threshold: float,
+    conf_scale_range: tuple,
+    *,
+    train_prob_cal: np.ndarray,
+    train_r: np.ndarray,
+) -> float:
+    """
+    Confidence-based position multiplier (pre vol-scale). 'confidence' is the
+    legacy linear ramp (default). 'ecdf' sizes by the probability's percentile
+    rank within training; 'kelly' uses a fractional-Kelly edge estimate.
+    """
+    lo, hi = float(conf_scale_range[0]), float(conf_scale_range[1])
+    if mode == "confidence":
+        m = 0.5 + (probability - threshold) / max(1e-9, 1.0 - threshold) * 1.5
+    elif mode == "ecdf":
+        rank = float(np.mean(train_prob_cal <= probability))
+        m = 0.5 + rank * 1.5
+    elif mode == "kelly":
+        wins = train_r[train_r > 0]
+        losses = train_r[train_r < 0]
+        b = (wins.mean() / abs(losses.mean())) if (len(wins) and len(losses)) else 1.0
+        b = max(b, 0.1)
+        f = (probability * b - (1.0 - probability)) / b
+        m = max(f, 0.0) * 4.0  # ~quarter-Kelly scaled into the multiplier band
+    else:
+        raise ValueError(f"Unknown sizing_mode: {mode}")
+    return _clamp(m, lo, hi)
+
+
 TARGET_DEFINITION = (
     "Signal observed after H1 bar t closes, entry at open[t+1], "
     "TP=+1.5 ATR(20)[t], SL adapts between 0.8/1.0 ATR(20)[t] by confidence, "
@@ -358,6 +414,8 @@ def walk_forward_meta_labeling(
     risk_per_trade: float = 0.01,
     thresholds: Sequence[float] = (0.50, 0.55, 0.60, 0.65),
     meta_config: dict[str, Any] | None = None,
+    probability_calibration: str = "none",
+    sizing_mode: str = "confidence",
 ) -> Dict:
     """
     Walk-forward validation for the meta-labeling architecture with adaptive
@@ -442,6 +500,13 @@ def walk_forward_meta_labeling(
         is_accuracy = accuracy_score(y_train, train_pred)
         is_accuracies.append(float(is_accuracy))
 
+        # In-sample probability calibration + sizing inputs (no leakage).
+        calibrator = _fit_probability_calibrator(
+            probability_calibration, train_prob, y_train.to_numpy()
+        )
+        train_prob_cal = np.asarray(calibrator(train_prob))
+        train_r_arr = train_df.loc[train_mask, "realized_r"].astype(float).to_numpy()
+
         if int(test_binary_mask.sum()) > 0:
             X_test_binary = test_df.loc[test_binary_mask, feature_cols]
             y_test_binary = test_df.loc[test_binary_mask, "outcome_binary"].astype(int)
@@ -453,7 +518,10 @@ def walk_forward_meta_labeling(
             oos_accuracy = np.nan
 
         X_test_signals = test_df.loc[test_signal_mask, feature_cols]
-        signal_prob = pd.Series(model.predict_proba(X_test_signals)[:, 1], index=X_test_signals.index, dtype=float)
+        raw_signal_prob = model.predict_proba(X_test_signals)[:, 1]
+        signal_prob = pd.Series(
+            np.asarray(calibrator(raw_signal_prob)), index=X_test_signals.index, dtype=float
+        )
 
         for timestamp, row in test_df.loc[test_signal_mask].iterrows():
             probability = float(signal_prob.loc[timestamp])
@@ -489,8 +557,10 @@ def walk_forward_meta_labeling(
                 if probability < threshold:
                     continue
 
-                conf_scale = 0.5 + (probability - threshold) / max(1e-9, (1.0 - threshold)) * 1.5
-                conf_scale = _clamp(conf_scale, float(conf_scale_range[0]), float(conf_scale_range[1]))
+                conf_scale = _position_confidence_multiplier(
+                    sizing_mode, probability, threshold, conf_scale_range,
+                    train_prob_cal=train_prob_cal, train_r=train_r_arr,
+                )
                 position_scale = _clamp(
                     vol_scale * conf_scale,
                     float(combined_scale_clamp[0]),
@@ -584,6 +654,7 @@ def walk_forward_meta_labeling(
         "avg_oos_accuracy": f"{avg_oos_accuracy * 100:.1f}%",
         "overfit_ratio": _format_ratio(overfit_ratio),
         "fold_results": fold_results,
+        "filtered_trades": {float(t): filtered_trades[float(t)] for t in thresholds},
         "equity_curve": [],
         "target_type": "meta-labeling on raw rule-based signals",
         "target_definition": TARGET_DEFINITION,
