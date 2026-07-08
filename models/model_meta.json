@@ -1,0 +1,63 @@
+{
+  "model_file": "model.pkl",
+  "sha256_prefix": "cd34f5c8acca04ae",
+  "created_commit": "34c6014 (Apr 6) = current HEAD lineage",
+  "model_type": "XGBClassifier",
+  "hyperparameters": {
+    "n_estimators_actual": 74,
+    "n_estimators_configured": 500,
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 10,
+    "gamma": 0.3,
+    "objective": "multi:softprob",
+    "random_state": 42
+  },
+  "training": {
+    "script": "model.py train_model() via backtest.py / main.py",
+    "feature_set": "FEATURE_COLS (live/backtest path)",
+    "n_features": 26,
+    "features": [
+      "rsi_14", "macd_line", "macd_signal", "macd_hist", "ema_20", "ema_50",
+      "ema_ratio", "bb_upper", "bb_lower", "bb_mid", "bb_pct", "atr_14", "adx_14",
+      "price_momentum", "volatility_ratio", "bb_position", "macd_cross",
+      "rsi_extreme", "is_london", "is_ny", "is_overlap", "hour_sin", "hour_cos",
+      "dow_sin", "dow_cos", "h1_trend"
+    ],
+    "classes": [-1, 0, 1],
+    "labeling": "labelling.apply_triple_barrier (TIME_LIMIT=25)",
+    "data_range": "2023-01-01 .. 2026-03-20 (EURUSD M15; NOTE: 2024 absent from dataset)",
+    "seed": 42
+  },
+  "walk_forward_metrics_FEATURE_COLS": {
+    "method": "backtest.walk_forward_validation (TimeSeriesSplit n_splits=5, retrain per window)",
+    "result": "4 of 5 windows produced ZERO trades (OOS confidence < MIN_CONFIDENCE 0.65); window 5: return -4.70%, max_dd 11.49%, win_rate 35.25%, profit_factor 0.84, sharpe -1.31, trades 122",
+    "verdict": "NO validated out-of-sample edge. Do NOT deploy.",
+    "leakage_audit": "clean (causal features, per-window label purge, non-overlapping splits)"
+  },
+  "recommended_alternative_META": {
+    "note": "The genuinely validated edge is in the META meta-labeling pipeline (run_pipeline.py), NOT this model. This model.pkl is retained only as the current live artifact and is NOT recommended for the challenge.",
+    "pipeline": "run_pipeline.py -> validation.walk_forward_meta_labeling",
+    "config": "threshold 0.65, risk_per_trade 0.005, META_CONFIG defaults, purge_gap 10, embargo_gap 20, train_months 6, test_months 1",
+    "oos_metrics": {
+      "total_return_pct": 4.94,
+      "max_drawdown_pct": -3.36,
+      "win_rate_pct": 42.9,
+      "profit_factor": 1.37,
+      "sharpe_ratio": 2.21,
+      "total_trades": 77,
+      "avg_overfit_ratio": 1.2,
+      "span": "~21 active OOS test-months (2024 missing)"
+    },
+    "caveats": [
+      "Edge is thin: 77 trades, OOS accuracy (62.7%) ~= label-shuffle accuracy (62.0%), signal concentrated in roc_5_atr.",
+      "DD-compliant return ~2.8%/yr is slow vs typical prop profit target.",
+      "Not wired to live main.py (which uses FEATURE_COLS). Integration required before use.",
+      "High variance: Monte-Carlo on 77 trades likely shows tail DD breaching 4.5%."
+    ]
+  },
+  "generated_by": "Phase 3 reproducibility lockdown",
+  "generated_date": "2026-06-12"
+}
