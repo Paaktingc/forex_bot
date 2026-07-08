@@ -1,13 +1,23 @@
 """
 backtest.py
 
-Historical candle-by-candle backtesting for the THE5ERS forex bot.
-Implements strict no-lookahead feature generation, trade simulation,
-summary metrics, and walk-forward validation.
+Historical candle-by-candle backtesting for the The5ers Bootcamp bot.
+
+Primary engine: RulesBacktestEngine — backtests the RULES strategy
+(strategy.py, not the ML model) with conservative costs and the live
+pacing/risk gates, then feeds a Bootcamp step simulator + Monte Carlo.
+
+Single GO/NO-GO command:
+    python backtest.py --go-no-go
+GO only if P(breach −5%) < 1%, P(kill switch) < 10%, P(pass) > 70%, and
+PF ≥ 1.25 after costs in every walk-forward fold.
+
+The legacy model-driven BacktestEngine remains for the research pipeline.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -20,9 +30,11 @@ import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 
 import config
+import strategy as strategy_module
 from data_feed import get_ohlcv_from_csv
 from model import load_model, predict_signal, train_model
-from risk_manager import RiskManager
+from risk_manager import RiskManager, compute_sl_tp
+from symbol_specs import get_symbol_spec
 
 logger = logging.getLogger(__name__)
 
@@ -654,6 +666,400 @@ class BacktestEngine:
         }
 
 
+# ===========================================================================
+# Rules-strategy backtest (The5ers Bootcamp)
+# ===========================================================================
+
+GO_CRITERIA = {
+    "p_breach_official": ("P(breach −5%)", lambda v: v < 0.01, "< 1%"),
+    "p_kill_switch": ("P(hit −3% kill switch)", lambda v: v < 0.10, "< 10%"),
+    "p_pass": ("P(+6% before −5%)", lambda v: v > 0.70, "> 70%"),
+    "fold_pf": ("PF ≥ 1.25 after costs in every fold", lambda v: v, "all folds"),
+}
+
+
+class RulesBacktestEngine:
+    """
+    Bar-by-bar simulation of the rules strategy with:
+      - entry at next candle open, spread floored at
+        BACKTEST_SPREAD_FLOOR_PIPS + entry slippage
+      - SL exits filled with stop-out slippage (news slippage inside
+        historical news windows when data/news_events.csv exists)
+      - commission BACKTEST_COMMISSION_PER_LOT_RT per lot round trip
+      - breakeven SL move at +1R (from the NEXT bar, conservative)
+      - live pacing gates: sessions, rollover/server window, 2 trades/day,
+        2 consecutive losses/day, 5/week, −0.75% day stop, −1.5% week stop
+      - kill-switch tracking at −3% from starting balance (reported; set
+        stop_on_kill=True to also halt the simulation there)
+    """
+
+    def __init__(
+        self,
+        df_m15: pd.DataFrame,
+        df_h1: pd.DataFrame,
+        params: strategy_module.StrategyParams | None = None,
+        starting_balance: float = 10_000.0,
+        stop_on_kill: bool = False,
+    ) -> None:
+        self.df = _to_utc_index(df_m15)
+        self.df_h1 = _to_utc_index(df_h1)
+        self.params = params or strategy_module.StrategyParams()
+        self.starting_balance = float(starting_balance)
+        self.stop_on_kill = stop_on_kill
+        self.trades: list[dict[str, Any]] = []
+        self.news_events = self._load_news_events()
+
+        spec = get_symbol_spec(config.SYMBOL)
+        self.pip = spec.pip_size
+        self.pip_value = spec.pip_value_per_standard_lot
+        self.min_lot = spec.min_lot
+        self.lot_step = spec.lot_step
+        self.max_lot = spec.max_lot
+
+        self.spread = config.BACKTEST_SPREAD_FLOOR_PIPS * self.pip
+        self.slip_entry = config.BACKTEST_SLIPPAGE_ENTRY_PIPS * self.pip
+        self.slip_stop = config.BACKTEST_SLIPPAGE_STOP_PIPS * self.pip
+        self.slip_news = config.BACKTEST_SLIPPAGE_NEWS_PIPS * self.pip
+
+    def _load_news_events(self) -> pd.DataFrame:
+        path = _news_events_path()
+        if not path.exists():
+            logger.warning(
+                "No historical news file at %s — backtest runs without news "
+                "blackouts (live trading fails closed instead).",
+                path,
+            )
+            return pd.DataFrame(columns=["datetime_utc", "currency"])
+        df = pd.read_csv(path)
+        if not {"datetime_utc", "currency"} <= set(df.columns):
+            return pd.DataFrame(columns=["datetime_utc", "currency"])
+        df = df.copy()
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+        currencies = {config.SYMBOL[:3].upper(), config.SYMBOL[3:6].upper()}
+        df = df.dropna(subset=["datetime_utc"])
+        df = df[df["currency"].astype(str).str.upper().isin(currencies)]
+        return df.sort_values("datetime_utc")
+
+    def _in_news_window(self, ts: pd.Timestamp, buffer_mins: float | None = None) -> bool:
+        if self.news_events.empty:
+            return False
+        buffer_mins = buffer_mins or config.NEWS_BUFFER_MINS
+        minutes = (self.news_events["datetime_utc"] - ts).abs().dt.total_seconds() / 60.0
+        return bool((minutes <= buffer_mins).any())
+
+    def _lot_size(self, balance: float, sl_distance: float) -> float:
+        risk_amount = balance * config.RISK_PER_TRADE_PCT
+        sl_pips = sl_distance / self.pip
+        lot = risk_amount / (sl_pips * self.pip_value)
+        lot = min(lot, self.max_lot)
+        lot = np.floor(lot / self.lot_step + 1e-12) * self.lot_step
+        lot = round(float(lot), 2)
+        return lot if lot >= self.min_lot else 0.0
+
+    def run(self) -> dict[str, Any]:
+        df = self.df
+        signal_frame = strategy_module.build_signal_frame(df, self.df_h1, self.params)
+        signals = signal_frame["signal"].to_numpy()
+        swings = signal_frame["swing_price"].to_numpy()
+        atrs = signal_frame["atr_14"].to_numpy()
+        atr_medians = signal_frame["atr_median"].to_numpy()
+
+        opens = df["open"].to_numpy(dtype=float)
+        highs = df["high"].to_numpy(dtype=float)
+        lows = df["low"].to_numpy(dtype=float)
+        closes = df["close"].to_numpy(dtype=float)
+        index = df.index
+
+        balance = self.starting_balance
+        self.trades = []
+        equity_curve: list[float] = []
+
+        # Pacing state (mirrors RiskManager live behavior)
+        day = None
+        week = None
+        day_start_balance = balance
+        week_start_balance = balance
+        trades_today = 0
+        consec_losses_day = 0
+        consec_losses_week = 0
+        halted_today = False
+        halted_this_week = False
+
+        kill_level = self.starting_balance * (1.0 - config.KILL_SWITCH_PCT)
+        kill_switch_hit = False
+        kill_switch_time = None
+        trading_disabled = False
+
+        open_trade: dict[str, Any] | None = None
+
+        def _close_trade(trade, exit_price, exit_time, reason):
+            nonlocal balance, consec_losses_day, consec_losses_week
+            d = trade["direction"]
+            pnl_pips = (exit_price - trade["entry"]) * d / self.pip
+            pnl = pnl_pips * self.pip_value * trade["lot"]
+            pnl -= config.BACKTEST_COMMISSION_PER_LOT_RT * trade["lot"]
+            balance_before = balance
+            balance = balance + pnl
+            r_mult = ((exit_price - trade["entry"]) * d) / trade["risk_distance"]
+            result = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BE")
+            if result == "LOSS":
+                consec_losses_day += 1
+                consec_losses_week += 1
+            elif result == "WIN":
+                consec_losses_day = 0
+                consec_losses_week = 0
+            self.trades.append(
+                {
+                    **trade,
+                    "exit": exit_price,
+                    "exit_time": exit_time,
+                    "exit_reason": reason,
+                    "pnl_currency": round(pnl, 2),
+                    "pct_return": pnl / balance_before,
+                    "r_multiple": r_mult,
+                    "result": result,
+                }
+            )
+
+        for i in range(1, len(df)):
+            ts = index[i]
+
+            # -------- calendar resets (server time == UTC by default) ------
+            ts_day = ts.date()
+            ts_week = ts.isocalendar()[:2]
+            if day != ts_day:
+                day = ts_day
+                day_start_balance = balance
+                trades_today = 0
+                consec_losses_day = 0
+                halted_today = False
+            if week != ts_week:
+                week = ts_week
+                week_start_balance = balance
+                consec_losses_week = 0
+                halted_this_week = False
+
+            # -------- manage the open position ----------------------------
+            if open_trade is not None:
+                d = open_trade["direction"]
+                sl = open_trade["sl"]
+                tp = open_trade["tp"]
+                sl_hit = lows[i] <= sl if d == 1 else highs[i] >= sl
+                tp_hit = highs[i] >= tp if d == 1 else lows[i] <= tp
+
+                if sl_hit:  # conservative: SL before TP when both touch
+                    slip = self.slip_news if self._in_news_window(ts) else self.slip_stop
+                    _close_trade(open_trade, sl - d * slip, ts, "SL")
+                    open_trade = None
+                elif tp_hit:
+                    _close_trade(open_trade, tp, ts, "TP")
+                    open_trade = None
+                else:
+                    if not open_trade["be_moved"]:
+                        trigger = open_trade["be_trigger"]
+                        reached = highs[i] >= trigger if d == 1 else lows[i] <= trigger
+                        if reached:
+                            # SL to entry from the NEXT bar (can't know
+                            # intra-bar ordering)
+                            open_trade["sl"] = open_trade["entry"]
+                            open_trade["be_moved"] = True
+
+            # -------- equity & kill switch --------------------------------
+            floating = 0.0
+            if open_trade is not None:
+                d = open_trade["direction"]
+                floating = (
+                    (closes[i] - open_trade["entry"]) * d / self.pip
+                ) * self.pip_value * open_trade["lot"]
+            equity = balance + floating
+            equity_curve.append(equity)
+
+            if not kill_switch_hit and equity <= kill_level:
+                kill_switch_hit = True
+                kill_switch_time = ts
+                if self.stop_on_kill:
+                    trading_disabled = True
+                    if open_trade is not None:
+                        _close_trade(open_trade, closes[i], ts, "KILL_SWITCH")
+                        open_trade = None
+
+            # -------- entry gates ------------------------------------------
+            if open_trade is not None or trading_disabled:
+                continue
+            sig = int(signals[i - 1])  # signal at close of bar i-1 → enter at open[i]
+            if sig == 0:
+                continue
+
+            if halted_today or halted_this_week:
+                continue
+            if trades_today >= config.MAX_TRADES_PER_DAY:
+                continue
+            if consec_losses_day >= config.MAX_CONSEC_LOSSES_DAY:
+                halted_today = True
+                continue
+            if consec_losses_week >= config.MAX_CONSEC_LOSSES_WEEK:
+                halted_this_week = True
+                continue
+            if day_start_balance > 0 and (day_start_balance - equity) / day_start_balance >= config.DAILY_LOSS_PCT:
+                halted_today = True
+                continue
+            if week_start_balance > 0 and (week_start_balance - equity) / week_start_balance >= config.WEEKLY_STOP_PCT:
+                halted_this_week = True
+                continue
+
+            if not strategy_module.entry_session_ok(ts):
+                continue
+            hour = ts.hour
+            if config.ROLLOVER_START_UTC <= hour < config.ROLLOVER_END_UTC:
+                continue
+            if self._in_news_window(ts, config.NEWS_MAJOR_BUFFER_MINS):
+                continue
+
+            atr = float(atrs[i - 1])
+            atr_median = float(atr_medians[i - 1]) if np.isfinite(atr_medians[i - 1]) else None
+            if not strategy_module.volatility_ok(
+                atr / self.pip, atr_median / self.pip if atr_median else None
+            ):
+                continue
+
+            # -------- entry --------------------------------------------------
+            raw_open = opens[i]
+            entry = raw_open + sig * (self.spread + self.slip_entry)
+            sl_tp = compute_sl_tp(sig, entry, atr, swing_price=float(swings[i - 1]))
+            if sl_tp is None:
+                continue
+            sl, tp = sl_tp
+            risk_distance = (entry - sl) if sig == 1 else (sl - entry)
+            lot = self._lot_size(balance, risk_distance)
+            if lot <= 0:
+                continue
+
+            be_trigger = entry + sig * config.BE_AT_R * risk_distance
+            open_trade = {
+                "direction": sig,
+                "entry_time": ts,
+                "entry": entry,
+                "sl": sl,
+                "sl_initial": sl,   # "sl" moves to entry on the BE trigger
+                "tp": tp,
+                "lot": lot,
+                "risk_distance": risk_distance,
+                "be_trigger": be_trigger,
+                "be_moved": False,
+            }
+            trades_today += 1
+
+        # close any trailing open trade at the last close
+        if open_trade is not None:
+            _close_trade(open_trade, closes[-1], index[-1], "END_OF_DATA")
+            open_trade = None
+
+        pct_returns = np.array([t["pct_return"] for t in self.trades], dtype=float)
+        r_multiples = np.array([t["r_multiple"] for t in self.trades], dtype=float)
+        from monte_carlo_dd import trade_stats as _stats
+
+        metrics = _stats(pct_returns, r_multiples)
+        metrics.update(
+            {
+                "ending_balance": round(balance, 2),
+                "total_return_pct": round(
+                    (balance - self.starting_balance) / self.starting_balance * 100.0, 2
+                ),
+                "kill_switch_hit": kill_switch_hit,
+                "kill_switch_time": str(kill_switch_time) if kill_switch_time else None,
+                "start": str(index[0]),
+                "end": str(index[-1]),
+            }
+        )
+        return metrics
+
+    def pct_returns(self) -> np.ndarray:
+        return np.array([t["pct_return"] for t in self.trades], dtype=float)
+
+    def r_multiples(self) -> np.ndarray:
+        return np.array([t["r_multiple"] for t in self.trades], dtype=float)
+
+
+def _print_rules_metrics(metrics: dict[str, Any]) -> None:
+    print("\nRULES-STRATEGY BACKTEST (after costs)")
+    print("-" * 56)
+    print(f"Period:                {metrics['start']} → {metrics['end']}")
+    print(f"Trades:                {metrics['trades']}")
+    print(f"Total return:          {metrics['total_return_pct']:.2f}%")
+    print(f"Profit factor:         {metrics['profit_factor']}")
+    print(f"Win rate:              {metrics['win_rate_pct']:.2f}%")
+    print(f"Avg R:                 {metrics['avg_r']}")
+    print(f"Expectancy/trade:      {metrics['expectancy_pct']:.4f}%")
+    print(f"Max drawdown:          {metrics['max_drawdown_pct']:.2f}%")
+    print(f"Longest losing streak: {metrics['longest_losing_streak']}")
+    print(f"Kill switch (−3%):     {'HIT at ' + str(metrics['kill_switch_time']) if metrics['kill_switch_hit'] else 'never hit'}")
+
+
+def run_go_no_go(fast: bool = False) -> dict[str, Any]:
+    """
+    Single-command GO/NO-GO evaluation:
+      1. full-history rules backtest with costs
+      2. 24m/6m walk-forward (6m step) incl. parameter perturbation
+      3. ≥20,000 block-bootstrap Monte Carlo paths through the Bootcamp
+         step simulator
+      4. verdict: GO only if P(breach −5%) < 1%, P(kill) < 10%,
+         P(pass) > 70%, and PF ≥ 1.25 after costs in EVERY fold.
+    """
+    from monte_carlo_dd import print_step_report, run_step_monte_carlo
+    from validation import walk_forward_rules
+
+    df_m15 = get_ohlcv_from_csv("EURUSD", "M15")
+    df_h1 = get_ohlcv_from_csv("EURUSD", "H1")
+
+    engine = RulesBacktestEngine(df_m15, df_h1)
+    metrics = engine.run()
+    _print_rules_metrics(metrics)
+
+    if metrics["trades"] < 30:
+        print("\n⛔ NO-GO: fewer than 30 trades in the full backtest — no basis for inference.")
+        return {"verdict": "NO-GO", "reason": "insufficient trades", "metrics": metrics}
+
+    folds = walk_forward_rules(df_m15, df_h1, perturb=not fast)
+    print("\nWALK-FORWARD (24m train / 6m test, 6m step)")
+    print("-" * 56)
+    all_folds_pf_ok = True
+    for fold in folds:
+        pf = fold["profit_factor"]
+        ok = (pf == float("inf")) or (pf >= 1.25)
+        if fold["trades"] < 5:
+            ok = False  # too few trades to trust the fold
+        all_folds_pf_ok &= ok
+        perturbed = fold.get("perturbed_pf_range")
+        print(
+            f"Fold {fold['fold']}: test {fold['test_start']}→{fold['test_end']}  "
+            f"trades={fold['trades']}  PF={pf}  ret={fold['total_return_pct']:.2f}%  "
+            f"maxDD={fold['max_drawdown_pct']:.2f}%"
+            + (f"  perturbed PF {perturbed[0]:.2f}–{perturbed[1]:.2f}" if perturbed else "")
+            + ("  ✓" if ok else "  ✗")
+        )
+
+    n_paths = 2_000 if fast else 20_000
+    mc = run_step_monte_carlo(engine.pct_returns(), engine.r_multiples(), n_paths=n_paths)
+    print_step_report(mc)
+
+    checks = {
+        "P(breach −5%) < 1%": mc["p_breach_official"] < 0.01,
+        "P(kill switch) < 10%": mc["p_kill_switch"] < 0.10,
+        "P(pass) > 70%": mc["p_pass"] > 0.70,
+        "PF ≥ 1.25 in every fold": all_folds_pf_ok,
+    }
+    verdict = "GO" if all(checks.values()) else "NO-GO"
+
+    print("\n" + "=" * 56)
+    print("GO/NO-GO VERDICT")
+    print("=" * 56)
+    for label, passed in checks.items():
+        print(f"  {'PASS' if passed else 'FAIL'}  {label}")
+    print(f"\n  ➜ {verdict}" + ("" if verdict == "GO" else "  — do not run this on a challenge account."))
+
+    return {"verdict": verdict, "checks": checks, "metrics": metrics, "monte_carlo": mc, "folds": folds}
+
+
 def _print_monte_carlo_block(result: dict) -> None:
     print("\nMONTE CARLO (1,000× bootstrap on trade P&L)")
     print("-" * 56)
@@ -668,12 +1074,41 @@ def _print_monte_carlo_block(result: dict) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="The5ers Bootcamp backtests")
+    parser.add_argument(
+        "--go-no-go", action="store_true",
+        help="Full GO/NO-GO evaluation: rules backtest + walk-forward + Monte Carlo.",
+    )
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Reduced Monte Carlo paths / no perturbation (smoke test only).",
+    )
+    parser.add_argument(
+        "--legacy-model", action="store_true",
+        help="Run the legacy ML-model backtest instead of the rules strategy.",
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     logging.getLogger("risk_manager").setLevel(logging.ERROR)
 
+    if not args.legacy_model:
+        if args.go_no_go:
+            run_go_no_go(fast=args.fast)
+        else:
+            df_m15 = get_ohlcv_from_csv("EURUSD", "M15")
+            df_h1 = get_ohlcv_from_csv("EURUSD", "H1")
+            engine = RulesBacktestEngine(df_m15, df_h1)
+            _print_rules_metrics(engine.run())
+        return
+
+    _legacy_model_main()
+
+
+def _legacy_model_main() -> None:
     try:
         df_m15 = get_ohlcv_from_csv("EURUSD", "M15")
         df_h1 = get_ohlcv_from_csv("EURUSD", "H1")

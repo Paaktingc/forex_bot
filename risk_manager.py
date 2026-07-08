@@ -70,6 +70,57 @@ def is_no_trade_server_window(now: datetime | None = None) -> bool:
     return minutes >= start or minutes < end
 
 
+def compute_sl_tp(
+    signal: int,
+    entry_price: float,
+    atr: float,
+    swing_price: float | None = None,
+    symbol: str | None = None,
+) -> tuple[float, float] | None:
+    """
+    Stateless SL/TP math (shared by RiskManager and the backtester).
+
+    SL = SL_ATR_MULT (1.5) × ATR beyond the pullback swing (falls back to the
+    entry price when no swing is supplied). The resulting SL distance must be
+    inside [SL_MIN_PIPS, SL_MAX_PIPS]; otherwise the trade is SKIPPED
+    (returns None) — the stop is never widened or narrowed to fit.
+
+    TP = TP_R (2.0) × the ACTUAL SL distance (an R multiple, not ATR).
+    """
+    if atr is None or atr <= 0:
+        return None
+
+    spec = get_symbol_spec(symbol or config.SYMBOL)
+    pip_size = spec.pip_size if spec else 0.0001
+
+    anchor = swing_price if swing_price is not None else entry_price
+    if signal == 1:   # Buy: SL below the pullback swing low
+        sl = anchor - config.SL_ATR_MULT * atr
+        sl_distance = entry_price - sl
+    else:             # Sell: SL above the pullback swing high
+        sl = anchor + config.SL_ATR_MULT * atr
+        sl_distance = sl - entry_price
+
+    if sl_distance <= 0:
+        logger.warning("compute_sl_tp: non-positive SL distance — skipping trade.")
+        return None
+
+    sl_pips = sl_distance / pip_size
+    if sl_pips < config.SL_MIN_PIPS or sl_pips > config.SL_MAX_PIPS:
+        logger.info(
+            f"compute_sl_tp: SL {sl_pips:.1f} pips outside "
+            f"[{config.SL_MIN_PIPS}, {config.SL_MAX_PIPS}] clamp — skipping trade."
+        )
+        return None
+
+    if signal == 1:
+        tp = entry_price + config.TP_R * sl_distance
+    else:
+        tp = entry_price - config.TP_R * sl_distance
+
+    return round(sl, 5), round(tp, 5)
+
+
 class RiskManager:
     """Stateful risk manager for The5ers Bootcamp forex bot."""
 
@@ -504,39 +555,7 @@ class RiskManager:
 
         Returns (sl, tp) rounded to 5 dp, or None to skip the trade.
         """
-        if atr is None or atr <= 0:
-            return None
-
-        spec = get_symbol_spec(symbol or config.SYMBOL)
-        pip_size = spec.pip_size if spec else 0.0001
-
-        if signal == 1:   # Buy: SL below the pullback swing low
-            anchor = swing_price if swing_price is not None else entry_price
-            sl = anchor - config.SL_ATR_MULT * atr
-            sl_distance = entry_price - sl
-        else:             # Sell: SL above the pullback swing high
-            anchor = swing_price if swing_price is not None else entry_price
-            sl = anchor + config.SL_ATR_MULT * atr
-            sl_distance = sl - entry_price
-
-        if sl_distance <= 0:
-            logger.warning("calculate_sl_tp: non-positive SL distance — skipping trade.")
-            return None
-
-        sl_pips = sl_distance / pip_size
-        if sl_pips < config.SL_MIN_PIPS or sl_pips > config.SL_MAX_PIPS:
-            logger.info(
-                f"calculate_sl_tp: SL {sl_pips:.1f} pips outside "
-                f"[{config.SL_MIN_PIPS}, {config.SL_MAX_PIPS}] clamp — skipping trade."
-            )
-            return None
-
-        if signal == 1:
-            tp = entry_price + config.TP_R * sl_distance
-        else:
-            tp = entry_price - config.TP_R * sl_distance
-
-        return round(sl, 5), round(tp, 5)
+        return compute_sl_tp(signal, entry_price, atr, swing_price, symbol)
 
     @staticmethod
     def breakeven_trigger_price(signal: int, entry_price: float, sl_price: float) -> float:

@@ -257,10 +257,10 @@ def test_walk_forward_validation_returns_five_windows_plus_average(dummy_artifac
     assert results[-1]["total_return_pct"] == 3.0
 
 
-def test_main_logs_error_when_csvs_are_missing(monkeypatch, tmp_path, caplog):
+def test_legacy_main_logs_error_when_csvs_are_missing(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr(backtest.config, "DATA_DIR", tmp_path / "missing_data")
     caplog.set_level("ERROR")
 
-    backtest.main()
+    backtest._legacy_model_main()
 
     assert "Failed to load historical CSVs" in caplog.text
