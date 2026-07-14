@@ -63,3 +63,8 @@ logs/
 
 # Local model backups (keep validated artifacts only, see exception above)
 models/*.bak_*
+
+# Raw HistData archives are bulky and reproducible via download_m1_data.py /
+# scratchpad fetch driver; keep new ones out of git (files tracked earlier remain tracked)
+data/raw/
+trades_log.csv

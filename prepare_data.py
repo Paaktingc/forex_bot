@@ -15,8 +15,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 M15_OUTPUT = PROJECT_ROOT / "data" / "EURUSD_M15_real.csv"
 H1_OUTPUT = PROJECT_ROOT / "data" / "EURUSD_H1_real.csv"
-PRICE_MIN = 1.00
-PRICE_MAX = 1.25
+# EURUSD sanity bounds for the 2015–present window (2022 low ≈ 0.9536,
+# 2018 high ≈ 1.2555)
+PRICE_MIN = 0.90
+PRICE_MAX = 1.30
 MIN_M15_BARS = 35_000
 
 
@@ -29,24 +31,52 @@ def find_raw_files() -> list[Path]:
     return files
 
 
+HISTDATA_TZ = "America/New_York"
+
+
 def load_histdata_csv(file: Path) -> pd.DataFrame:
-    df = pd.read_csv(
-        file,
-        header=None,
-        names=["date", "time", "open", "high", "low", "close", "volume"],
-    )
-    try:
-        df["datetime"] = pd.to_datetime(
-            df["date"].astype(str) + " " + df["time"].astype(str).str.zfill(6),
-            format="%Y%m%d %H%M%S",
+    """
+    Loads a HistData M1 file (either the semicolon 'ASCII' layout with a
+    single 'YYYYMMDD HHMMSS' field, or the comma 'MT' layout with separate
+    date/time fields).
+
+    IMPORTANT timezone note: HistData timestamps are US EASTERN local time —
+    the market opens Sunday 17:00 and closes Friday 16:59 file-time in both
+    winter and summer (verified across 2015/2023/2024 files). They were
+    previously mislabelled as UTC, shifting every session by 4–5 hours.
+    """
+    with open(file, "r", encoding="utf-8", errors="ignore") as handle:
+        first_line = handle.readline()
+
+    if ";" in first_line:  # ASCII layout: '20150101 130000;o;h;l;c;v'
+        df = pd.read_csv(
+            file,
+            sep=";",
+            header=None,
+            names=["datetime", "open", "high", "low", "close", "volume"],
         )
-    except ValueError:
+        df["datetime"] = pd.to_datetime(
+            df["datetime"].astype(str), format="%Y%m%d %H%M%S"
+        )
+    else:  # MT layout: '2023.01.01,17:04,o,h,l,c,v'
+        df = pd.read_csv(
+            file,
+            header=None,
+            names=["date", "time", "open", "high", "low", "close", "volume"],
+        )
         df["datetime"] = pd.to_datetime(
             df["date"].astype(str) + " " + df["time"].astype(str),
             format="%Y.%m.%d %H:%M",
         )
+
     df.set_index("datetime", inplace=True)
-    df.index = df.index.tz_localize("UTC")
+    # DST transitions happen 02:00 Sunday local when the market is closed,
+    # so ambiguous/nonexistent stamps should not occur; drop any that do.
+    df.index = df.index.tz_localize(
+        HISTDATA_TZ, ambiguous="NaT", nonexistent="NaT"
+    )
+    df = df[df.index.notna()]
+    df.index = df.index.tz_convert("UTC")
     return df[["open", "high", "low", "close", "volume"]]
 
 
