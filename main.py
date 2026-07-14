@@ -189,6 +189,11 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
         logger.warning(f"process_candle: blocked — {reason}")
         return
 
+    # regime_daily mode takes exactly ONE entry per day (the first valid one)
+    if config.ENTRY_MODE == "regime_daily" and state.risk.trades_today >= 1:
+        logger.info("process_candle: regime_daily entry already taken today.")
+        return
+
     # Step 3: session window (entries 08:00–17:00 London, Friday cutoff, …)
     now = datetime.now(UTC)
     if not strategy.entry_session_ok(now):

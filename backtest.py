@@ -693,6 +693,8 @@ class RulesBacktestEngine:
         stop_on_kill=True to also halt the simulation there)
     """
 
+    _BE_CONFIG = "config"  # sentinel: be_at_r follows config.BE_AT_R
+
     def __init__(
         self,
         df_m15: pd.DataFrame,
@@ -700,12 +702,24 @@ class RulesBacktestEngine:
         params: strategy_module.StrategyParams | None = None,
         starting_balance: float = 10_000.0,
         stop_on_kill: bool = False,
+        sl_atr_mult: float | None = None,
+        tp_r: float | None = None,
+        be_at_r: float | None | str = _BE_CONFIG,
+        collect_diagnostics: bool = False,
     ) -> None:
         self.df = _to_utc_index(df_m15)
         self.df_h1 = _to_utc_index(df_h1)
         self.params = params or strategy_module.StrategyParams()
         self.starting_balance = float(starting_balance)
         self.stop_on_kill = stop_on_kill
+        # Exit-parameter overrides exist for research sweeps only;
+        # be_at_r=None disables the breakeven move entirely.
+        self.sl_atr_mult = config.SL_ATR_MULT if sl_atr_mult is None else sl_atr_mult
+        self.tp_r = config.TP_R if tp_r is None else tp_r
+        self.be_at_r = config.BE_AT_R if be_at_r == self._BE_CONFIG else be_at_r
+        self.collect_diagnostics = collect_diagnostics
+        self.funnel: dict[str, int] = {}
+        self.shadow_trades: list[dict[str, Any]] = []
         self.trades: list[dict[str, Any]] = []
         self.news_events = self._load_news_events()
 
@@ -756,6 +770,112 @@ class RulesBacktestEngine:
         lot = round(float(lot), 2)
         return lot if lot >= self.min_lot else 0.0
 
+    def _news_mask(self, index: pd.DatetimeIndex, buffer_mins: float) -> np.ndarray:
+        """Boolean per-bar mask: bar timestamp within ±buffer of any event."""
+        mask = np.zeros(len(index), dtype=bool)
+        if self.news_events.empty:
+            return mask
+        buffer = pd.Timedelta(minutes=buffer_mins)
+        for ts in self.news_events["datetime_utc"]:
+            mask |= (index >= ts - buffer) & (index <= ts + buffer)
+        return mask
+
+    def _walk_exit(
+        self,
+        i_entry: int,
+        direction: int,
+        entry: float,
+        sl: float,
+        tp: float,
+        risk_distance: float,
+        use_be: bool,
+    ) -> dict[str, Any]:
+        """
+        Walks bars after i_entry with the SAME exit rules as the live loop
+        (SL-first conservatism, news slippage on stops, BE move effective
+        from the bar after the trigger). Zero account impact — used for
+        shadow candidates and no-BE counterfactuals. Returns R after costs.
+        """
+        highs, lows, closes = self._highs, self._lows, self._closes
+        d = direction
+        cur_sl = sl
+        be_moved = not use_be or self.be_at_r is None
+        be_trigger = entry + d * (self.be_at_r or 0.0) * risk_distance
+        hh, ll = -np.inf, np.inf
+        commission_r = (
+            config.BACKTEST_COMMISSION_PER_LOT_RT
+            / ((risk_distance / self.pip) * self.pip_value)
+        )
+
+        n = len(highs)
+        for j in range(i_entry + 1, n):
+            hh = max(hh, highs[j])
+            ll = min(ll, lows[j])
+            sl_hit = lows[j] <= cur_sl if d == 1 else highs[j] >= cur_sl
+            tp_hit = highs[j] >= tp if d == 1 else lows[j] <= tp
+            if sl_hit:
+                slip = self.slip_news if self._news_bar_mask[j] else self.slip_stop
+                exit_price = cur_sl - d * slip
+                reason = "SL"
+            elif tp_hit:
+                exit_price, reason = tp, "TP"
+            else:
+                if not be_moved:
+                    reached = highs[j] >= be_trigger if d == 1 else lows[j] <= be_trigger
+                    if reached:
+                        cur_sl = entry
+                        be_moved = True
+                continue
+            r = (exit_price - entry) * d / risk_distance - commission_r
+            mfe = ((hh - entry) if d == 1 else (entry - ll)) / risk_distance
+            mae = ((entry - ll) if d == 1 else (hh - entry)) / risk_distance
+            return {
+                "r": r, "exit_reason": reason, "exit_idx": j,
+                "mfe_r": mfe, "mae_r": mae,
+            }
+
+        exit_price = closes[-1]
+        r = (exit_price - entry) * d / risk_distance - commission_r
+        mfe = ((hh - entry) if d == 1 else (entry - ll)) / risk_distance if n > i_entry + 1 else 0.0
+        mae = ((entry - ll) if d == 1 else (hh - entry)) / risk_distance if n > i_entry + 1 else 0.0
+        return {
+            "r": r, "exit_reason": "END_OF_DATA", "exit_idx": n - 1,
+            "mfe_r": mfe, "mae_r": mae,
+        }
+
+    def _record_kill(self, stage: str, i: int, sig: int, atr: float, swing: float) -> None:
+        """
+        Counts a funnel kill and (in diagnostics mode) shadow-simulates the
+        killed candidate at zero risk with the normal clamped SL/TP. For the
+        sl_clamp stage itself the shadow uses the UNCLAMPED stop, to measure
+        what the clamp threw away.
+        """
+        self.funnel[stage] = self.funnel.get(stage, 0) + 1
+        if not self.collect_diagnostics or sig == 0 or not np.isfinite(atr) or atr <= 0:
+            return
+        entry = self._opens[i] + sig * (self.spread + self.slip_entry)
+        swing_arg = float(swing) if np.isfinite(swing) else None
+        sl_tp = compute_sl_tp(
+            sig, entry, atr, swing_price=swing_arg,
+            sl_atr_mult=self.sl_atr_mult, tp_r=self.tp_r,
+        )
+        if sl_tp is None:
+            if stage != "sl_clamp":
+                return  # would have been clamp-skipped anyway — not thrown away
+            anchor = swing_arg if swing_arg is not None else entry
+            sl = anchor - sig * self.sl_atr_mult * atr
+            risk = (entry - sl) * sig
+            if risk <= 0:
+                return
+            tp = entry + sig * self.tp_r * risk
+        else:
+            sl, tp = sl_tp
+            risk = (entry - sl) * sig
+        shadow = self._walk_exit(i, sig, entry, sl, tp, risk, use_be=True)
+        shadow.update({"kill_stage": stage, "entry_time": self.df.index[i],
+                       "direction": sig, "risk_pips": risk / self.pip})
+        self.shadow_trades.append(shadow)
+
     def run(self) -> dict[str, Any]:
         df = self.df
         signal_frame = strategy_module.build_signal_frame(df, self.df_h1, self.params)
@@ -769,6 +889,19 @@ class RulesBacktestEngine:
         lows = df["low"].to_numpy(dtype=float)
         closes = df["close"].to_numpy(dtype=float)
         index = df.index
+        # cached for _walk_exit / _record_kill
+        self._opens, self._highs, self._lows, self._closes = opens, highs, lows, closes
+        self._news_bar_mask = self._news_mask(index, config.NEWS_BUFFER_MINS)
+
+        self.funnel = {
+            "bars": int(len(df)),
+            "regime_bars": int((signal_frame["regime"] != 0).sum()),
+            "pullback_bars": int(
+                (signal_frame["long_pullback"] | signal_frame["short_pullback"]).sum()
+            ),
+            "signals": int((signals != 0).sum()),
+        }
+        self.shadow_trades = []
 
         balance = self.starting_balance
         self.trades = []
@@ -800,7 +933,8 @@ class RulesBacktestEngine:
             pnl -= config.BACKTEST_COMMISSION_PER_LOT_RT * trade["lot"]
             balance_before = balance
             balance = balance + pnl
-            r_mult = ((exit_price - trade["entry"]) * d) / trade["risk_distance"]
+            risk = trade["risk_distance"]
+            r_mult = ((exit_price - trade["entry"]) * d) / risk
             result = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BE")
             if result == "LOSS":
                 consec_losses_day += 1
@@ -808,18 +942,32 @@ class RulesBacktestEngine:
             elif result == "WIN":
                 consec_losses_day = 0
                 consec_losses_week = 0
-            self.trades.append(
-                {
-                    **trade,
-                    "exit": exit_price,
-                    "exit_time": exit_time,
-                    "exit_reason": reason,
-                    "pnl_currency": round(pnl, 2),
-                    "pct_return": pnl / balance_before,
-                    "r_multiple": r_mult,
-                    "result": result,
-                }
-            )
+
+            record = {
+                **trade,
+                "exit": exit_price,
+                "exit_time": exit_time,
+                "exit_reason": reason,
+                "pnl_currency": round(pnl, 2),
+                "pct_return": pnl / balance_before,
+                "r_multiple": r_mult,
+                "result": result,
+            }
+            if trade["hh"] > -np.inf:
+                record["mfe_r"] = ((trade["hh"] - trade["entry"]) if d == 1
+                                   else (trade["entry"] - trade["ll"])) / risk
+                record["mae_r"] = ((trade["entry"] - trade["ll"]) if d == 1
+                                   else (trade["hh"] - trade["entry"])) / risk
+            else:
+                record["mfe_r"] = record["mae_r"] = 0.0
+            if self.collect_diagnostics:
+                no_be = self._walk_exit(
+                    trade["entry_idx"], d, trade["entry"], trade["sl_initial"],
+                    trade["tp"], risk, use_be=False,
+                )
+                record["no_be_r"] = no_be["r"]
+                record["no_be_reason"] = no_be["exit_reason"]
+            self.trades.append(record)
 
         for i in range(1, len(df)):
             ts = index[i]
@@ -844,11 +992,13 @@ class RulesBacktestEngine:
                 d = open_trade["direction"]
                 sl = open_trade["sl"]
                 tp = open_trade["tp"]
+                open_trade["hh"] = max(open_trade["hh"], highs[i])
+                open_trade["ll"] = min(open_trade["ll"], lows[i])
                 sl_hit = lows[i] <= sl if d == 1 else highs[i] >= sl
                 tp_hit = highs[i] >= tp if d == 1 else lows[i] <= tp
 
                 if sl_hit:  # conservative: SL before TP when both touch
-                    slip = self.slip_news if self._in_news_window(ts) else self.slip_stop
+                    slip = self.slip_news if self._news_bar_mask[i] else self.slip_stop
                     _close_trade(open_trade, sl - d * slip, ts, "SL")
                     open_trade = None
                 elif tp_hit:
@@ -884,59 +1034,92 @@ class RulesBacktestEngine:
                         open_trade = None
 
             # -------- entry gates ------------------------------------------
-            if open_trade is not None or trading_disabled:
-                continue
             sig = int(signals[i - 1])  # signal at close of bar i-1 → enter at open[i]
             if sig == 0:
                 continue
+            atr = float(atrs[i - 1])
+            swing = float(swings[i - 1])
+
+            if trading_disabled:
+                self._record_kill("disabled", i, sig, atr, swing)
+                continue
+            if open_trade is not None:
+                self._record_kill("position_busy", i, sig, atr, swing)
+                continue
 
             if halted_today or halted_this_week:
+                self._record_kill("pacing_halted", i, sig, atr, swing)
                 continue
-            if trades_today >= config.MAX_TRADES_PER_DAY:
+            max_trades_today = (
+                1 if self.params.entry_mode == "regime_daily"
+                else config.MAX_TRADES_PER_DAY
+            )
+            if trades_today >= max_trades_today:
+                self._record_kill("pacing_trades_per_day", i, sig, atr, swing)
                 continue
             if consec_losses_day >= config.MAX_CONSEC_LOSSES_DAY:
                 halted_today = True
+                self._record_kill("pacing_consec_day", i, sig, atr, swing)
                 continue
             if consec_losses_week >= config.MAX_CONSEC_LOSSES_WEEK:
                 halted_this_week = True
+                self._record_kill("pacing_consec_week", i, sig, atr, swing)
                 continue
             if day_start_balance > 0 and (day_start_balance - equity) / day_start_balance >= config.DAILY_LOSS_PCT:
                 halted_today = True
+                self._record_kill("pacing_daily_loss", i, sig, atr, swing)
                 continue
             if week_start_balance > 0 and (week_start_balance - equity) / week_start_balance >= config.WEEKLY_STOP_PCT:
                 halted_this_week = True
+                self._record_kill("pacing_weekly_loss", i, sig, atr, swing)
                 continue
 
             if not strategy_module.entry_session_ok(ts):
+                self._record_kill("session", i, sig, atr, swing)
                 continue
             hour = ts.hour
             if config.ROLLOVER_START_UTC <= hour < config.ROLLOVER_END_UTC:
+                self._record_kill("rollover", i, sig, atr, swing)
                 continue
             if self._in_news_window(ts, config.NEWS_MAJOR_BUFFER_MINS):
+                self._record_kill("news", i, sig, atr, swing)
                 continue
 
-            atr = float(atrs[i - 1])
             atr_median = float(atr_medians[i - 1]) if np.isfinite(atr_medians[i - 1]) else None
-            if not strategy_module.volatility_ok(
-                atr / self.pip, atr_median / self.pip if atr_median else None
-            ):
+            atr_pips = atr / self.pip
+            if not np.isfinite(atr_pips) or atr_pips < config.ATR_MIN_PIPS:
+                self._record_kill("vol_floor", i, sig, atr, swing)
+                continue
+            if atr_median and atr_pips > config.ATR_MAX_MEDIAN_MULT * (atr_median / self.pip):
+                self._record_kill("vol_ceiling", i, sig, atr, swing)
                 continue
 
             # -------- entry --------------------------------------------------
             raw_open = opens[i]
             entry = raw_open + sig * (self.spread + self.slip_entry)
-            sl_tp = compute_sl_tp(sig, entry, atr, swing_price=float(swings[i - 1]))
+            swing_arg = float(swing) if np.isfinite(swing) else None
+            sl_tp = compute_sl_tp(
+                sig, entry, atr, swing_price=swing_arg,
+                sl_atr_mult=self.sl_atr_mult, tp_r=self.tp_r,
+            )
             if sl_tp is None:
+                self._record_kill("sl_clamp", i, sig, atr, swing)
                 continue
             sl, tp = sl_tp
             risk_distance = (entry - sl) if sig == 1 else (sl - entry)
             lot = self._lot_size(balance, risk_distance)
             if lot <= 0:
+                self._record_kill("lot_zero", i, sig, atr, swing)
                 continue
 
-            be_trigger = entry + sig * config.BE_AT_R * risk_distance
+            self.funnel["executed"] = self.funnel.get("executed", 0) + 1
+            be_trigger = (
+                entry + sig * self.be_at_r * risk_distance
+                if self.be_at_r is not None else None
+            )
             open_trade = {
                 "direction": sig,
+                "entry_idx": i,
                 "entry_time": ts,
                 "entry": entry,
                 "sl": sl,
@@ -945,7 +1128,9 @@ class RulesBacktestEngine:
                 "lot": lot,
                 "risk_distance": risk_distance,
                 "be_trigger": be_trigger,
-                "be_moved": False,
+                "be_moved": self.be_at_r is None,
+                "hh": -np.inf,
+                "ll": np.inf,
             }
             trades_today += 1
 
@@ -969,6 +1154,7 @@ class RulesBacktestEngine:
                 "kill_switch_time": str(kill_switch_time) if kill_switch_time else None,
                 "start": str(index[0]),
                 "end": str(index[-1]),
+                "funnel": dict(self.funnel),
             }
         )
         return metrics

@@ -178,3 +178,36 @@ class TestRulesBacktestEngineSmoke:
         entries = pd.Series([t["entry_time"].date() for t in engine.trades])
         if not entries.empty:
             assert entries.value_counts().max() <= 2
+
+
+class TestEngineExitOverrides:
+    def _engine(self, **kw):
+        import backtest
+        import pandas as pd
+
+        df15 = backtest.get_ohlcv_from_csv("EURUSD", "M15").iloc[-6000:]
+        dfh1 = backtest.get_ohlcv_from_csv("EURUSD", "H1")
+        dfh1 = dfh1.loc[dfh1.index >= df15.index[0].floor("h") - pd.Timedelta(days=30)]
+        return backtest.RulesBacktestEngine(df15, dfh1, **kw)
+
+    def test_be_disabled_never_scratches(self):
+        eng = self._engine(be_at_r=None)
+        eng.run()
+        for t in eng.trades:
+            # without BE, every SL exit is a full loss (SL never at entry)
+            if t["exit_reason"] == "SL":
+                assert abs(t["r_multiple"]) > 0.5
+
+    def test_tp_override_changes_target(self):
+        eng = self._engine(tp_r=1.5)
+        eng.run()
+        for t in eng.trades:
+            risk = abs(t["entry"] - t["sl_initial"])
+            assert abs(t["tp"] - t["entry"]) == pytest.approx(1.5 * risk, abs=1e-4)
+
+    def test_defaults_follow_config(self):
+        import config
+        eng = self._engine()
+        assert eng.be_at_r == config.BE_AT_R
+        assert eng.tp_r == config.TP_R
+        assert eng.sl_atr_mult == config.SL_ATR_MULT

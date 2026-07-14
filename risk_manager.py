@@ -76,6 +76,8 @@ def compute_sl_tp(
     atr: float,
     swing_price: float | None = None,
     symbol: str | None = None,
+    sl_atr_mult: float | None = None,
+    tp_r: float | None = None,
 ) -> tuple[float, float] | None:
     """
     Stateless SL/TP math (shared by RiskManager and the backtester).
@@ -86,19 +88,26 @@ def compute_sl_tp(
     (returns None) — the stop is never widened or narrowed to fit.
 
     TP = TP_R (2.0) × the ACTUAL SL distance (an R multiple, not ATR).
+
+    sl_atr_mult / tp_r default to config; overrides exist for research
+    (walk-forward perturbation and exit sweeps) only.
     """
     if atr is None or atr <= 0:
         return None
+    if sl_atr_mult is None:
+        sl_atr_mult = config.SL_ATR_MULT
+    if tp_r is None:
+        tp_r = config.TP_R
 
     spec = get_symbol_spec(symbol or config.SYMBOL)
     pip_size = spec.pip_size if spec else 0.0001
 
     anchor = swing_price if swing_price is not None else entry_price
     if signal == 1:   # Buy: SL below the pullback swing low
-        sl = anchor - config.SL_ATR_MULT * atr
+        sl = anchor - sl_atr_mult * atr
         sl_distance = entry_price - sl
     else:             # Sell: SL above the pullback swing high
-        sl = anchor + config.SL_ATR_MULT * atr
+        sl = anchor + sl_atr_mult * atr
         sl_distance = sl - entry_price
 
     if sl_distance <= 0:
@@ -114,9 +123,9 @@ def compute_sl_tp(
         return None
 
     if signal == 1:
-        tp = entry_price + config.TP_R * sl_distance
+        tp = entry_price + tp_r * sl_distance
     else:
-        tp = entry_price - config.TP_R * sl_distance
+        tp = entry_price - tp_r * sl_distance
 
     return round(sl, 5), round(tp, 5)
 

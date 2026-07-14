@@ -64,6 +64,15 @@ BE_AT_R = 1.0                         # Move SL to breakeven at +1.0R (once, rat
 SL_MIN_PIPS = 8.0                     # Skip trade if clamp violated (never widen/narrow)
 SL_MAX_PIPS = 25.0
 
+# Entry generation
+# "pullback_rsi": original M15 pullback + RSI recross (measured ~PF 0.99 —
+#   the confirmation trigger subtracts the regime edge; see research_log.md)
+# "regime_daily": ONE entry per London day at the first in-session bar where
+#   the H1 regime held at the prior close; SL anchored at entry. Best honest
+#   configuration found (PF 1.10 on 2015-2025 design window) but still
+#   NO-GO against the Bootcamp gates — do not deploy without a new edge.
+ENTRY_MODE = "regime_daily"
+
 # Entry filters
 MAX_SPREAD_PIPS = 1.2                 # Skip entries when spread exceeds this
 ATR_MIN_PIPS = 4.0                    # Skip if ATR(14, M15) below this

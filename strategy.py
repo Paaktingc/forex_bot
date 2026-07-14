@@ -59,6 +59,12 @@ class StrategyParams:
     swing_window_h1: int = 20            # H1 bars for the retracement swing
     sl_atr_mult: float = field(default_factory=lambda: config.SL_ATR_MULT)
     tp_r: float = field(default_factory=lambda: config.TP_R)
+    # "pullback_rsi": M15 pullback + RSI-recross confirmation (original)
+    # "regime_daily": one entry at the first in-session bar each London day
+    #                 while the H1 regime holds; SL anchored at entry.
+    #                 Adopted from the 2026-07 component ablation — see
+    #                 research_log.md Phase 2c.
+    entry_mode: str = field(default_factory=lambda: config.ENTRY_MODE)
 
 
 @dataclass(frozen=True)
@@ -67,7 +73,8 @@ class Candidate:
 
     direction: int                       # 1 buy, -1 sell
     signal_time: pd.Timestamp            # close time of the trigger M15 bar
-    swing_price: float                   # pullback extreme (SL anchor)
+    swing_price: float | None            # pullback extreme (SL anchor); None
+                                         # → SL anchored at the entry price
     atr: float                           # M15 ATR(14) at signal time
     atr_median: float | None = None      # trailing 20-day ATR median (vol filter)
     reason: str = "H1 regime + M15 pullback"
@@ -79,6 +86,23 @@ class Candidate:
 
 def _ema_with_span(close: pd.Series, span: int) -> pd.Series:
     return close.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+def entry_session_mask(index: pd.DatetimeIndex) -> np.ndarray:
+    """
+    Vectorized equivalent of entry_session_ok for a UTC DatetimeIndex:
+    Mon–Fri 08:00–17:00 Europe/London, Friday cut at FRIDAY_CUTOFF_LONDON.
+    """
+    local = index.tz_convert(ZoneInfo(config.LONDON_TZ))
+    hours = np.asarray(local.hour)
+    weekdays = np.asarray(local.weekday)
+    ok = (
+        (weekdays < 5)
+        & (hours >= config.SESSION_START_LONDON)
+        & (hours < config.SESSION_END_LONDON)
+    )
+    ok &= ~((weekdays == 4) & (hours >= config.FRIDAY_CUTOFF_LONDON))
+    return ok
 
 
 def h1_regime(df_h1: pd.DataFrame, params: StrategyParams | None = None) -> pd.Series:
@@ -189,15 +213,34 @@ def build_signal_frame(
     )
 
     signal = pd.Series(0, index=m15.index, dtype=int)
-    signal[long_trigger] = 1
-    signal[short_trigger] = -1
-
-    # SL anchor: the pullback extreme over the lookback window incl. trigger bar
+    swing_price = pd.Series(np.nan, index=m15.index, dtype=float)
     swing_low_m15 = low.rolling(lookback + 1, min_periods=1).min()
     swing_high_m15 = high.rolling(lookback + 1, min_periods=1).max()
-    swing_price = pd.Series(np.nan, index=m15.index, dtype=float)
-    swing_price[long_trigger] = swing_low_m15[long_trigger]
-    swing_price[short_trigger] = swing_high_m15[short_trigger]
+
+    if params.entry_mode == "regime_daily":
+        # One candidate per London day: the signal sits on the bar whose
+        # NEXT scheduled bar (close time + 15 min, known from the clock —
+        # no lookahead) is in-session, while the H1 regime holds at this
+        # bar's close. Only the day's FIRST such bar signals; no
+        # later-in-day retries — the Phase-2c ablation showed the edge
+        # lives in the day's first regime-valid bar and later entries
+        # dilute it (research_log.md, configs #1/#1b/#1c). SL anchors at
+        # the entry (swing stays NaN).
+        next_bar_time = m15.index + pd.Timedelta(minutes=15)
+        session_next = pd.Series(entry_session_mask(next_bar_time), index=m15.index)
+        eligible = session_next & (regime != 0)
+        entry_dates = pd.Series(
+            next_bar_time.tz_convert(ZoneInfo(config.LONDON_TZ)).date, index=m15.index
+        )
+        first_eligible = eligible & ~entry_dates.where(eligible).duplicated()
+        signal[first_eligible] = regime[first_eligible]
+    else:
+        signal[long_trigger] = 1
+        signal[short_trigger] = -1
+        # SL anchor: the pullback extreme over the lookback window incl.
+        # the trigger bar
+        swing_price[long_trigger] = swing_low_m15[long_trigger]
+        swing_price[short_trigger] = swing_high_m15[short_trigger]
 
     atr = m15["atr_14"]
     return pd.DataFrame(
@@ -208,6 +251,16 @@ def build_signal_frame(
             "atr_median": atr.rolling(
                 ATR_MEDIAN_WINDOW_BARS, min_periods=_BARS_PER_DAY_M15 * 5
             ).median(),
+            # diagnostic columns (funnel instrumentation / ablations)
+            "regime": regime,
+            "ema_pull": ema_pull,
+            "rsi": rsi,
+            "long_touch": long_touch,
+            "short_touch": short_touch,
+            "long_pullback": long_pullback,
+            "short_pullback": short_pullback,
+            "swing_low": swing_low_m15,
+            "swing_high": swing_high_m15,
         },
         index=m15.index,
     )
@@ -239,14 +292,15 @@ def generate_candidate(
     last = frame.iloc[-1]
     if int(last["signal"]) == 0:
         return None
-    if not np.isfinite(last["swing_price"]) or not np.isfinite(last["atr_14"]):
+    if not np.isfinite(last["atr_14"]):
         return None
 
+    swing = float(last["swing_price"]) if np.isfinite(last["swing_price"]) else None
     atr_median = float(last["atr_median"]) if np.isfinite(last["atr_median"]) else None
     return Candidate(
         direction=int(last["signal"]),
         signal_time=frame.index[-1],
-        swing_price=float(last["swing_price"]),
+        swing_price=swing,
         atr=float(last["atr_14"]),
         atr_median=atr_median,
     )

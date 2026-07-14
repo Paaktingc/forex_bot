@@ -125,14 +125,20 @@ def _trending_market_with_pullback() -> tuple[pd.DataFrame, pd.DataFrame]:
 class TestEntryTrigger:
     def test_pullback_recross_generates_long_signals(self):
         df_m15, df_h1 = _trending_market_with_pullback()
-        frame = build_signal_frame(df_m15, df_h1, StrategyParams(use_adx_gate=False))
+        frame = build_signal_frame(
+            df_m15, df_h1,
+            StrategyParams(use_adx_gate=False, entry_mode="pullback_rsi"),
+        )
         signals = frame["signal"]
         assert (signals == 1).any(), "expected at least one long trigger"
         assert not (signals == -1).any(), "no shorts in a long regime"
 
     def test_signal_carries_swing_and_atr(self):
         df_m15, df_h1 = _trending_market_with_pullback()
-        frame = build_signal_frame(df_m15, df_h1, StrategyParams(use_adx_gate=False))
+        frame = build_signal_frame(
+            df_m15, df_h1,
+            StrategyParams(use_adx_gate=False, entry_mode="pullback_rsi"),
+        )
         fired = frame[frame["signal"] == 1]
         assert np.isfinite(fired["swing_price"]).all()
         assert np.isfinite(fired["atr_14"]).all()
@@ -144,20 +150,24 @@ class TestEntryTrigger:
         flat = np.full(500, 1.10)  # no regime possible
         df_h1 = _make_h1(flat)
         df_m15, _ = _trending_market_with_pullback()
-        frame = build_signal_frame(df_m15, df_h1, StrategyParams(use_adx_gate=False))
+        frame = build_signal_frame(
+            df_m15, df_h1,
+            StrategyParams(use_adx_gate=False, entry_mode="pullback_rsi"),
+        )
         assert (frame["signal"] == 0).all()
 
     def test_generate_candidate_returns_none_when_quiet(self):
         df_m15, df_h1 = _trending_market_with_pullback()
         # Kill the last bar's trigger by forcing RSI to stay high (no recross)
         candidate = generate_candidate(
-            df_m15.iloc[:50], df_h1.iloc[:50], StrategyParams(use_adx_gate=False)
+            df_m15.iloc[:50], df_h1.iloc[:50],
+            StrategyParams(use_adx_gate=False, entry_mode="pullback_rsi"),
         )
         assert candidate is None
 
     def test_generate_candidate_matches_last_frame_row(self):
         df_m15, df_h1 = _trending_market_with_pullback()
-        params = StrategyParams(use_adx_gate=False)
+        params = StrategyParams(use_adx_gate=False, entry_mode="pullback_rsi")
         frame = build_signal_frame(df_m15, df_h1, params)
         trigger_times = frame.index[frame["signal"] == 1]
         assert len(trigger_times) > 0
@@ -240,3 +250,73 @@ class TestSessionFilter:
     def test_naive_datetime_rejected(self):
         with pytest.raises(ValueError):
             entry_session_ok(datetime(2026, 1, 14, 9, 0))
+
+
+# ---------------------------------------------------------------------------
+# regime_daily entry mode (adopted from the 2026-07 ablation; research_log.md)
+# ---------------------------------------------------------------------------
+
+class TestRegimeDailyMode:
+    def _frames(self):
+        # Strong H1 uptrend + gently rising M15 series spanning several days
+        h1_prices = np.linspace(1.05, 1.15, 500)
+        df_h1 = _make_h1(h1_prices, start="2025-01-01")
+        n = 960  # 10 days of M15 bars
+        m15_prices = np.linspace(1.13, 1.15, n)
+        start = df_h1.index[-1] - pd.Timedelta(minutes=15 * (n - 1))
+        df_m15 = _make_m15(m15_prices, start=start)
+        return df_m15, df_h1
+
+    def test_at_most_one_signal_per_london_day(self):
+        from zoneinfo import ZoneInfo
+        df_m15, df_h1 = self._frames()
+        params = StrategyParams(entry_mode="regime_daily", use_adx_gate=False)
+        frame = build_signal_frame(df_m15, df_h1, params)
+        fired = frame[frame["signal"] != 0]
+        assert len(fired) > 0
+        # entry executes at the NEXT bar; group those by London date
+        entry_bars = [
+            frame.index[frame.index.get_loc(t) + 1] for t in fired.index
+            if frame.index.get_loc(t) + 1 < len(frame)
+        ]
+        days = pd.Series([t.tz_convert(ZoneInfo("Europe/London")).date() for t in entry_bars])
+        assert days.value_counts().max() == 1
+
+    def test_entry_bar_is_in_session_and_signal_bar_may_not_be(self):
+        df_m15, df_h1 = self._frames()
+        params = StrategyParams(entry_mode="regime_daily", use_adx_gate=False)
+        frame = build_signal_frame(df_m15, df_h1, params)
+        import strategy as strategy_module
+        for t in frame.index[frame["signal"] != 0]:
+            pos = frame.index.get_loc(t) + 1
+            if pos < len(frame):
+                assert strategy_module.entry_session_ok(frame.index[pos])
+
+    def test_no_regime_no_daily_signal(self):
+        df_m15, _ = self._frames()
+        flat_h1 = _make_h1(np.full(500, 1.10))
+        params = StrategyParams(entry_mode="regime_daily", use_adx_gate=False)
+        frame = build_signal_frame(df_m15, flat_h1, params)
+        assert (frame["signal"] == 0).all()
+
+    def test_swing_is_nan_and_candidate_swing_none(self):
+        df_m15, df_h1 = self._frames()
+        params = StrategyParams(entry_mode="regime_daily", use_adx_gate=False)
+        frame = build_signal_frame(df_m15, df_h1, params)
+        fired = frame[frame["signal"] != 0]
+        assert fired["swing_price"].isna().all()  # SL anchors at entry
+
+        trigger_pos = frame.index.get_loc(fired.index[-1]) + 1
+        candidate = generate_candidate(df_m15.iloc[:trigger_pos], df_h1, params)
+        assert candidate is not None
+        assert candidate.swing_price is None
+
+
+class TestEntrySessionMask:
+    def test_mask_matches_scalar_function(self):
+        import strategy as strategy_module
+        # spans winter, DST changeover, summer, Fridays and weekends
+        index = pd.date_range("2026-03-25", "2026-04-08", freq="97min", tz="UTC")
+        mask = strategy_module.entry_session_mask(index)
+        for ts, ok in zip(index, mask):
+            assert ok == strategy_module.entry_session_ok(ts), str(ts)
