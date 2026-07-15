@@ -347,3 +347,43 @@ class TestRegimeDaily2Mode:
             assert len(entries) <= 2, f"{day}: {entries}"
             if len(entries) == 2:
                 assert entries[1].hour >= 13  # second anchor is the NY overlap
+
+
+class TestRangeFadeMode:
+    def _frames(self):
+        # Flat H1 → regime == 0 everywhere (fade precondition)
+        df_h1 = _make_h1(np.full(500, 1.10))
+        # M15: quiet Asian session then a poke above the Asian high that
+        # closes back inside, during the London fade window
+        idx = pd.date_range("2025-01-06 00:00", periods=48, freq="15min", tz="UTC")
+        base = np.full(48, 1.1000)
+        df = pd.DataFrame(
+            {"open": base, "high": base + 0.0004, "low": base - 0.0004,
+             "close": base, "volume": 500}, index=idx,
+        )
+        # Asian range (00:00–07:59 London == UTC in January): ±4 pips
+        poke = idx.get_loc(pd.Timestamp("2025-01-06 08:30", tz="UTC"))
+        df.iloc[poke, df.columns.get_loc("high")] = 1.1015   # poke above 1.1004
+        df.iloc[poke, df.columns.get_loc("close")] = 1.1000  # close back inside
+        return df, df_h1
+
+    def test_poke_and_reject_generates_short(self):
+        df_m15, df_h1 = self._frames()
+        params = StrategyParams(entry_mode="range_fade", use_adx_gate=False)
+        frame = build_signal_frame(df_m15, df_h1, params)
+        fired = frame[frame["signal"] != 0]
+        assert len(fired) == 1
+        assert int(fired["signal"].iloc[0]) == -1
+        # SL anchors at the poke extreme
+        assert fired["swing_price"].iloc[0] == pytest.approx(1.1015)
+
+    def test_no_fade_when_regime_active(self):
+        df_m15, _ = self._frames()
+        # Trend must be WARM (EMA200 formed) by the M15 window (2025-01-06):
+        # 800 hourly bars starting 2024-12-05 cover it with regime active
+        trending_h1 = _make_h1(np.linspace(1.05, 1.15, 800), start="2024-12-05")
+        params = StrategyParams(entry_mode="range_fade", use_adx_gate=False)
+        regime = strategy.h1_regime(trending_h1, params)
+        assert regime.loc["2025-01-06"].iloc[0] == 1  # premise: regime active
+        frame = build_signal_frame(df_m15, trending_h1, params)
+        assert (frame["signal"] == 0).all()

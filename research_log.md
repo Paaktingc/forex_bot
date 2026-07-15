@@ -366,3 +366,73 @@ Actionable residuals for the user (outside backtest scope):
 - A genuinely new, uncorrelated signal family (different session/style)
   is the only remaining path to the gates; that is new-strategy research,
   not refinement of this one.
+
+---
+
+# Research cycle 4 (2026-07-15) — verified costs + second signal family
+
+Goal (user-directed): build the strongest legitimate case for a GO. The
+gates are unchanged and will not be bent; if the evidence falls short the
+verdict stays NO-GO.
+
+Pre-registration:
+- **Verified execution costs (primary source):** The5ers Help Center
+  "What are the spreads and commissions?" (updated 02.01.2026): majors
+  "sell from 0.2 pips to 0.9 pips"; forex commission **$4/lot round trip**.
+  Production backtest cost model updated to verified-conservative:
+  spread floors EURUSD 0.4 / GBPUSD 0.6 pips (upper-middle of the quoted
+  range), commission $4/lot RT. Slippage assumptions UNCHANGED (0.3 entry
+  / 1.0 stop / 2.0 news — not covered by their terms, stays ours,
+  conservative). Cycle-3 pre-registration explicitly conditioned this
+  update on primary-source verification; done.
+- **Family 2 — "range_fade" (fully specified before any run, 1 variant):**
+  On days with NO H1 regime at the prior close (regime==0 — orthogonal to
+  family 1 by construction): Asian range = high/low of 00:00–07:59 London
+  (≥12 bars required). In the 08:00–10:59 London entry window, if a bar
+  pokes above the Asian high and closes back inside → SHORT at next open;
+  mirror below the low → LONG. SL = 1.5×ATR beyond the poke extreme
+  (existing swing/clamp machinery, frozen 8–25-pip clamp), TP 2R, BE 1R
+  (identical exits to family 1), one trade/day/symbol, all existing
+  filters and pacing. NO parameter search: k=0 poke, fixed windows.
+- **Pooling:** family1+family2 on EU+GU (4 streams) under live global
+  constraints (one open trade, 2 entries/day global). Gates evaluated on
+  the design window; the lockbox is opened ONLY if all gates pass there.
+
+## Cycle-4 results
+
+**Config #23 — family 2 "range_fade" solo (design window): REJECTED.**
+EURUSD n=788 PF 0.853 (−0.06R); GBPUSD n=682 PF 0.798 (−0.10R). The
+failed-breakout fade of the Asian range on no-regime days has NO edge with
+2R targets through 8–25-pip stops. Per pre-registration (single variant, no
+parameter search) it is rejected, not tuned; pooling a negative stream is
+pointless. Mean reversion joins the list of components that subtract value.
+
+**Config #24 — family-1 EU+GU pool under VERIFIED The5ers costs
+(0.4/0.6-pip floors, $4/lot RT, slippage unchanged):**
+n=2150, **PF 1.165, WR 31.0%, +69.8% over 8.2y, maxDD 9.96%**
+Folds: 11/17 ≥ 1.0, 5/17 ≥ 1.25, min 0.727, median 1.127
+MC (20k): **P(pass)=66.4%, P(kill)=33.6%, P(breach −5%)=0.00%**, median
+112 trades to pass.
+
+| Gate | Required | Result | |
+|---|---|---|---|
+| P(breach −5%) | < 1% | 0.00% | PASS |
+| P(kill −3%) | < 10% | 33.6% | FAIL |
+| P(pass +6%) | > 70% | 66.4% | FAIL |
+| PF ≥ 1.25 every fold | 17/17 | 5/17 | FAIL |
+
+## Cycle-4 verdict — NO-GO stands. Lockbox still sealed.
+
+24 configurations, 4 cycles. The verified-cost update moved P(pass) from
+51.5% → 66.4% — the single biggest legitimate improvement found — but the
+gates require an edge this framework does not have. Both tested candidate
+families for a consistency-fixing second stream (afternoon momentum, Asian-
+range fade) are negative. Continuing to generate new families ad hoc would
+be data mining: each additional test cheapens any future "pass".
+
+Honest economics of the best configuration (informational, NOT a GO):
+P(pass one step) ≈ 0.66 → P(pass 3 Bootcamp steps) ≈ 0.66³ ≈ **29%**, with
+~34% chance per step of ending at the −3% self-imposed halt and ~0% chance
+of breaching the official −5%. Expected outcome of a challenge fee at these
+numbers is negative. The GO bar (P(pass)>70% per step, every-fold PF≥1.25)
+remains the right bar, and this strategy does not meet it.

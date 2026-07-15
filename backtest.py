@@ -1058,7 +1058,7 @@ class RulesBacktestEngine:
                 self._record_kill("pacing_halted", i, sig, atr, swing)
                 continue
             max_trades_today = (
-                1 if self.params.entry_mode == "regime_daily"
+                1 if self.params.entry_mode in ("regime_daily", "range_fade")
                 else config.MAX_TRADES_PER_DAY  # regime_daily2 uses the 2/day cap
             )
             if trades_today >= max_trades_today:

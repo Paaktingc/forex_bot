@@ -217,7 +217,45 @@ def build_signal_frame(
     swing_low_m15 = low.rolling(lookback + 1, min_periods=1).min()
     swing_high_m15 = high.rolling(lookback + 1, min_periods=1).max()
 
-    if params.entry_mode in ("regime_daily", "regime_daily2"):
+    if params.entry_mode == "range_fade":
+        # Family 2 (research_log.md cycle 4): failed-breakout fade of the
+        # Asian range on NO-regime days — orthogonal to the regime family
+        # by construction. Asian range = 00:00–07:59 London (≥12 bars).
+        # In the 08:00–10:59 London window: poke above the Asian high with
+        # a close back inside → SHORT at next open (mirror for longs).
+        # SL anchors at the poke extreme via the normal swing machinery.
+        lon = m15.index.tz_convert(ZoneInfo(config.LONDON_TZ))
+        dates = pd.Series(lon.date, index=m15.index)
+        is_asia = pd.Series((lon.hour >= 0) & (lon.hour < 8), index=m15.index)
+        asia_high = high.where(is_asia).groupby(dates).transform("max")
+        asia_low = low.where(is_asia).groupby(dates).transform("min")
+        asia_bars = is_asia.groupby(dates).transform("sum")
+        range_ok = (asia_bars >= 12) & asia_high.notna() & asia_low.notna()
+
+        next_bar_time = m15.index + pd.Timedelta(minutes=15)
+        lon_next = next_bar_time.tz_convert(ZoneInfo(config.LONDON_TZ))
+        fade_window = pd.Series(
+            entry_session_mask(next_bar_time), index=m15.index
+        ) & pd.Series((lon_next.hour >= 8) & (lon_next.hour < 11), index=m15.index)
+
+        no_regime = regime == 0
+        short_fade = (
+            fade_window & no_regime & range_ok
+            & (high > asia_high) & (close < asia_high)
+        )
+        long_fade = (
+            fade_window & no_regime & range_ok
+            & (low < asia_low) & (close > asia_low)
+        )
+        eligible = short_fade | long_fade
+        entry_dates = pd.Series(lon_next.date, index=m15.index)
+        first_eligible = eligible & ~entry_dates.where(eligible).duplicated()
+
+        signal[first_eligible & short_fade] = -1
+        signal[first_eligible & long_fade] = 1
+        swing_price[first_eligible & short_fade] = high[first_eligible & short_fade]
+        swing_price[first_eligible & long_fade] = low[first_eligible & long_fade]
+    elif params.entry_mode in ("regime_daily", "regime_daily2"):
         # One candidate per London day: the signal sits on the bar whose
         # NEXT scheduled bar (close time + 15 min, known from the clock —
         # no lookahead) is in-session, while the H1 regime holds at this

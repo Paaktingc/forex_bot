@@ -126,16 +126,19 @@ TRIPLE_BARRIER_UPPER_MULT = 0.9
 TRIPLE_BARRIER_LOWER_MULT = 0.6
 TRIPLE_BARRIER_TIME_LIMIT = 25
 
-# Backtest cost model (conservative; applied to the rules strategy)
-BACKTEST_SPREAD_FLOOR_PIPS = 0.6      # Recorded/estimated spread floored here
-# Per-symbol conservative raw-spread floors (pips) for multi-pair research
+# Backtest cost model — VERIFIED against The5ers Help Center ("What are the
+# spreads and commissions?", updated 02.01.2026): majors 0.2–0.9 pips,
+# forex commission $4/lot round trip. Floors sit at the upper-middle of the
+# quoted spread range; slippage stays our own conservative assumption.
+BACKTEST_SPREAD_FLOOR_PIPS = 0.4      # Recorded/estimated spread floored here
+# Per-symbol spread floors (pips)
 BACKTEST_SPREAD_FLOOR_BY_SYMBOL = {
-    "EURUSD": 0.6,
-    "GBPUSD": 0.9,
-    "AUDUSD": 0.8,
-    "USDJPY": 0.7,
+    "EURUSD": 0.4,
+    "GBPUSD": 0.6,
+    "AUDUSD": 0.6,
+    "USDJPY": 0.5,
 }
-BACKTEST_COMMISSION_PER_LOT_RT = 7.0  # USD per standard lot, round trip
+BACKTEST_COMMISSION_PER_LOT_RT = 4.0  # USD per standard lot, round trip (verified)
 BACKTEST_SLIPPAGE_ENTRY_PIPS = 0.3
 BACKTEST_SLIPPAGE_STOP_PIPS = 1.0
 BACKTEST_SLIPPAGE_NEWS_PIPS = 2.0
