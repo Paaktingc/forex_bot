@@ -303,3 +303,66 @@ mean-reversion regime complement) to raise pooled expectancy without
 displacement, or (c) accepting that a 50% step-pass probability with zero
 breach risk is simply what this edge is worth — below the bar for a
 funded-account attempt.
+
+---
+
+# Research cycle 3 (2026-07-15) — cost sensitivity + second session anchor
+
+Pre-registration:
+- **Lever C (cost sensitivity, no config change):** re-run the EU+GU pooled
+  configuration under 4 cost models — conservative (current: 0.6/0.9-pip
+  floors, $7/lot RT, 0.3-pip entry slip), typical raw-ECN (0.2/0.3, $6,
+  0.2), premium (0.1/0.2, $5, 0.1), zero (upper bound). Purpose: measure
+  how much of the gate shortfall is execution cost vs signal. This changes
+  NO conclusions by itself — the production cost model stays conservative
+  unless real The5ers conditions are verified better by the user.
+- **Lever D (second anchor within the framework):** entry_mode
+  "regime_daily2" = regime_daily plus ONE additional entry at the first
+  regime-valid bar at/after 13:00 London (NY-open overlap), max 2/day
+  global (existing cap), all other rules identical. Rationale: different
+  time-of-day anchor should reduce cross-pair displacement in the pool.
+  Selection rule unchanged: fold consistency on the design window.
+- Lockbox remains sealed unless a cycle-3 config passes all gates on
+  design data (same rule as cycle 2).
+
+## Cycle-3 Lever C — cost sensitivity (EU+GU pool, design window)
+
+| Cost model | PF | folds ≥1.0 | ≥1.25 | median PF | P(pass) | P(kill) |
+|---|---|---|---|---|---|---|
+| conservative (prod: 0.6/0.9p, $7, 0.3 slip) | 1.086 | 9/17 | 3/17 | 1.002 | 51.5% | 48.5% |
+| typical raw ECN (0.2/0.3p, $6, 0.2) | 1.191 | 12/17 | 7/17 | 1.223 | 70.4% | 29.6% |
+| premium (0.1/0.2p, $5, 0.1) | 1.256 | 11/17 | 8/17 | 1.248 | 78.4% | 21.6% |
+| zero (upper bound) | 1.428 | 15/17 | 11/17 | 1.479 | 90.0% | 10.0% |
+
+Execution costs are worth ≈0.34 PF. Under typical raw-ECN terms P(pass)
+reaches the 70% gate — but P(kill) (30%) and the every-fold PF gate (7/17)
+still fail, and **even at ZERO cost the every-fold gate fails (11/17)**:
+beyond costs, the edge's time-variability independently blocks the gates.
+Production cost model stays conservative (no config change).
+
+## Cycle-3 config #22 — Lever D: regime_daily2 (second NY-open anchor) — REJECTED
+
+EURUSD n=1991 PF 0.930; GBPUSD n=2454 PF 1.004; EU+GU pool n=3132
+**PF 0.941**, folds ≥1.0: 4/17, P(pass)=21.2%. Attribution: the
+afternoon-entry slice alone is NEGATIVE (n=1402, PF 0.928, −0.04R net).
+The edge is specifically the London-morning regime continuation; every
+other time-of-day variant tested (afternoon anchor, all-day retries,
+zone limits) subtracts value.
+
+## Cycle-3 verdict — NO-GO stands; lockbox still sealed; framework exhausted
+
+22 configurations across 3 cycles. Stable conclusions:
+1. The London-morning H1-regime edge is real (+0.10–0.12R gross,
+   replicated untuned on GBPUSD) and fully characterized.
+2. It is cost-bound first (≈0.34 PF of drag) and consistency-bound second
+   (even costless, per-fold PF ≥ 1.25 everywhere is out of reach).
+3. No configuration of this framework can pass the Bootcamp gates.
+   Further tuning would be curve-fitting; stopping per protocol.
+
+Actionable residuals for the user (outside backtest scope):
+- Verify The5ers' ACTUAL Bootcamp spreads/commissions; if they are at
+  raw-ECN levels, the measured P(pass) is ≈70% (still short on P(kill)
+  and fold consistency — informational, not a GO).
+- A genuinely new, uncorrelated signal family (different session/style)
+  is the only remaining path to the gates; that is new-strategy research,
+  not refinement of this one.

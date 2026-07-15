@@ -320,3 +320,30 @@ class TestEntrySessionMask:
         mask = strategy_module.entry_session_mask(index)
         for ts, ok in zip(index, mask):
             assert ok == strategy_module.entry_session_ok(ts), str(ts)
+
+
+class TestRegimeDaily2Mode:
+    def _frames(self):
+        h1_prices = np.linspace(1.05, 1.15, 500)
+        df_h1 = _make_h1(h1_prices, start="2025-01-01")
+        n = 960
+        m15_prices = np.linspace(1.13, 1.15, n)
+        start = df_h1.index[-1] - pd.Timedelta(minutes=15 * (n - 1))
+        return _make_m15(m15_prices, start=start), df_h1
+
+    def test_at_most_two_signals_per_day_second_after_1300_london(self):
+        from zoneinfo import ZoneInfo
+        df_m15, df_h1 = self._frames()
+        params = StrategyParams(entry_mode="regime_daily2", use_adx_gate=False)
+        frame = build_signal_frame(df_m15, df_h1, params)
+        fired = frame.index[frame["signal"] != 0]
+        assert len(fired) > 0
+        lon = ZoneInfo("Europe/London")
+        per_day = {}
+        for t in fired:
+            entry_time = (t + pd.Timedelta(minutes=15)).tz_convert(lon)
+            per_day.setdefault(entry_time.date(), []).append(entry_time)
+        for day, entries in per_day.items():
+            assert len(entries) <= 2, f"{day}: {entries}"
+            if len(entries) == 2:
+                assert entries[1].hour >= 13  # second anchor is the NY overlap

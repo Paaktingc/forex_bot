@@ -217,7 +217,7 @@ def build_signal_frame(
     swing_low_m15 = low.rolling(lookback + 1, min_periods=1).min()
     swing_high_m15 = high.rolling(lookback + 1, min_periods=1).max()
 
-    if params.entry_mode == "regime_daily":
+    if params.entry_mode in ("regime_daily", "regime_daily2"):
         # One candidate per London day: the signal sits on the bar whose
         # NEXT scheduled bar (close time + 15 min, known from the clock —
         # no lookahead) is in-session, while the H1 regime holds at this
@@ -229,11 +229,19 @@ def build_signal_frame(
         next_bar_time = m15.index + pd.Timedelta(minutes=15)
         session_next = pd.Series(entry_session_mask(next_bar_time), index=m15.index)
         eligible = session_next & (regime != 0)
-        entry_dates = pd.Series(
-            next_bar_time.tz_convert(ZoneInfo(config.LONDON_TZ)).date, index=m15.index
-        )
+        local_next = next_bar_time.tz_convert(ZoneInfo(config.LONDON_TZ))
+        entry_dates = pd.Series(local_next.date, index=m15.index)
         first_eligible = eligible & ~entry_dates.where(eligible).duplicated()
-        signal[first_eligible] = regime[first_eligible]
+        signal_bars = first_eligible
+        if params.entry_mode == "regime_daily2":
+            # Second anchor: the first regime-valid bar at/after 13:00
+            # London (NY-open overlap). Same rules; the global 2-trades/day
+            # cap applies. May coincide with the first anchor (then it is
+            # a single signal).
+            afternoon = eligible & pd.Series(local_next.hour >= 13, index=m15.index)
+            first_pm = afternoon & ~entry_dates.where(afternoon).duplicated()
+            signal_bars = first_eligible | first_pm
+        signal[signal_bars] = regime[signal_bars]
     else:
         signal[long_trigger] = 1
         signal[short_trigger] = -1
