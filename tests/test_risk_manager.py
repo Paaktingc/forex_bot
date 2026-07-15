@@ -253,7 +253,7 @@ class TestCalculateLotSize:
         assert lot == 5.0
 
     def test_unsupported_symbol_returns_zero(self, rm):
-        assert rm.calculate_lot_size(10_000, 1.0950, 1.1000, "GBPUSD") == 0.0
+        assert rm.calculate_lot_size(10_000, 1.0950, 1.1000, "NZDCAD") == 0.0
 
     def test_martingale_prevention(self, tmp_path):
         # Keep the equity decline within the warning threshold so this test

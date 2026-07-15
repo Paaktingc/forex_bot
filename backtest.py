@@ -706,12 +706,14 @@ class RulesBacktestEngine:
         tp_r: float | None = None,
         be_at_r: float | None | str = _BE_CONFIG,
         collect_diagnostics: bool = False,
+        symbol: str | None = None,
     ) -> None:
         self.df = _to_utc_index(df_m15)
         self.df_h1 = _to_utc_index(df_h1)
         self.params = params or strategy_module.StrategyParams()
         self.starting_balance = float(starting_balance)
         self.stop_on_kill = stop_on_kill
+        self.symbol = (symbol or config.SYMBOL).upper()
         # Exit-parameter overrides exist for research sweeps only;
         # be_at_r=None disables the breakeven move entirely.
         self.sl_atr_mult = config.SL_ATR_MULT if sl_atr_mult is None else sl_atr_mult
@@ -723,14 +725,19 @@ class RulesBacktestEngine:
         self.trades: list[dict[str, Any]] = []
         self.news_events = self._load_news_events()
 
-        spec = get_symbol_spec(config.SYMBOL)
+        spec = get_symbol_spec(self.symbol)
+        if spec is None:
+            raise ValueError(f"No symbol spec for {self.symbol}")
         self.pip = spec.pip_size
         self.pip_value = spec.pip_value_per_standard_lot
         self.min_lot = spec.min_lot
         self.lot_step = spec.lot_step
         self.max_lot = spec.max_lot
 
-        self.spread = config.BACKTEST_SPREAD_FLOOR_PIPS * self.pip
+        spread_floor = config.BACKTEST_SPREAD_FLOOR_BY_SYMBOL.get(
+            self.symbol, config.BACKTEST_SPREAD_FLOOR_PIPS
+        )
+        self.spread = spread_floor * self.pip
         self.slip_entry = config.BACKTEST_SLIPPAGE_ENTRY_PIPS * self.pip
         self.slip_stop = config.BACKTEST_SLIPPAGE_STOP_PIPS * self.pip
         self.slip_news = config.BACKTEST_SLIPPAGE_NEWS_PIPS * self.pip
@@ -749,7 +756,7 @@ class RulesBacktestEngine:
             return pd.DataFrame(columns=["datetime_utc", "currency"])
         df = df.copy()
         df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
-        currencies = {config.SYMBOL[:3].upper(), config.SYMBOL[3:6].upper()}
+        currencies = {self.symbol[:3], self.symbol[3:6]}
         df = df.dropna(subset=["datetime_utc"])
         df = df[df["currency"].astype(str).str.upper().isin(currencies)]
         return df.sort_values("datetime_utc")
@@ -856,7 +863,7 @@ class RulesBacktestEngine:
         entry = self._opens[i] + sig * (self.spread + self.slip_entry)
         swing_arg = float(swing) if np.isfinite(swing) else None
         sl_tp = compute_sl_tp(
-            sig, entry, atr, swing_price=swing_arg,
+            sig, entry, atr, swing_price=swing_arg, symbol=self.symbol,
             sl_atr_mult=self.sl_atr_mult, tp_r=self.tp_r,
         )
         if sl_tp is None:
@@ -1099,7 +1106,7 @@ class RulesBacktestEngine:
             entry = raw_open + sig * (self.spread + self.slip_entry)
             swing_arg = float(swing) if np.isfinite(swing) else None
             sl_tp = compute_sl_tp(
-                sig, entry, atr, swing_price=swing_arg,
+                sig, entry, atr, swing_price=swing_arg, symbol=self.symbol,
                 sl_atr_mult=self.sl_atr_mult, tp_r=self.tp_r,
             )
             if sl_tp is None:

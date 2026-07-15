@@ -200,3 +200,106 @@ gate level. The edge/cost ratio of a single-instrument EURUSD M15 system at
 2. Reduce cost drag structurally: H1-native entries (fewer, wider stops
    within the 25-pip clamp) cut the spread+commission share of R.
 3. Only after (1)/(2): revisit the gates with the pooled trade stream.
+
+---
+---
+
+# Research cycle 2 (2026-07-15) — pursuing the two recommended directions
+
+User-authorized continuation targeting the failing gates. Pre-registration:
+
+- **Gates unchanged**, risk layer unchanged (kill switch, 0.3% sizing,
+  8–25-pip SL clamp, pacing all frozen).
+- Design window unchanged: data before **2025-03-20**. Lockbox unchanged:
+  2025-03-20 → end. *Disclosure:* the EURUSD lockbox was opened once in
+  cycle 1 (config #1c, PF 0.894); it is partially burned for EURUSD and
+  fresh for other instruments. It will be opened once more, only for the
+  single final cycle-2 configuration.
+- **Lever A (cost drag):** widen the SL ATR multiplier (a strategy param
+  already perturbed in walk-forward, NOT frozen risk) within the frozen
+  clamp: sl_atr_mult ∈ {1.5 base, 2.0, 2.5, 3.0}. Rationale: costs are
+  ~1.4–1.9 pips per trade; on a 12-pip stop that is ~0.13R, on a 22-pip
+  stop ~0.07R — the diagnosis showed the gross edge (+0.11R) is real but
+  cost-consumed. Exits stay TP 2R / BE 1R (proven). Selection rule
+  (pre-registered): pick by fold consistency (folds ≥ 1.0, then min PF),
+  not best average; ties → smaller change from base.
+- **Lever B (pooling, project Lever 1):** run the SAME regime_daily rules
+  on GBPUSD, USDJPY, AUDUSD (2015→design end), per-pair conservative
+  spread floors, same commission; pool trade streams under the live
+  constraint of ONE open trade globally (first signal wins, ties by
+  symbol alphabetical — deterministic). Selection rule: pooling is adopted
+  only if it improves fold consistency vs the best single-instrument
+  config without raising per-trade risk.
+- Every configuration logged. Final config → lockbox once → gates.
+
+## Cycle-2 configs #10–#12 — Lever A: sl_atr_mult sweep (EURUSD design window)
+
+| sl×ATR | trades | overall PF | avg R | maxDD | folds ≥1.0 | ≥1.25 | min | median |
+|---|---|---|---|---|---|---|---|---|
+| 1.5 (base) | 1106 | **1.100** | +0.118 | 9.3% | 5 | 3 | 0.626 | 0.915 |
+| 2.0 | 1408 | 1.000 | +0.056 | 21.6% | 6 | 1 | 0.699 | 0.916 |
+| 2.5 | 1255 | 0.927 | +0.004 | 24.8% | 5 | 0 | 0.581 | 0.906 |
+| 3.0 | 1101 | 0.915 | −0.009 | 22.1% | 3 | 0 | 0.567 | 0.849 |
+
+**Lever A REJECTED** — monotonically worse: the cost-share saving of wider
+stops is dominated by the win-rate collapse as the 2R target moves further.
+Base 1.5×ATR retained. Cycle 2 proceeds on Lever B (pooling) only.
+
+## Cycle-2 configs #13–#18 — Lever B: per-pair runs and pooling (design window)
+
+Per-pair regime_daily under identical production gates (per-pair spread
+floors 0.6/0.9/0.7/0.8 pips, same commission):
+
+| Symbol | n | PF | avg R | ret | maxDD |
+|---|---|---|---|---|---|
+| EURUSD | 1106 | 1.100 | +0.118 | +18.6% | 9.3% |
+| GBPUSD | 1536 | **1.112** | +0.118 | +30.2% | 8.5% |
+| USDJPY | 1118 | 0.952 | +0.058 | −9.8% | 19.3% |
+| AUDUSD | 1092 | 0.939 | +0.029 | −11.4% | 23.7% |
+
+**GBPUSD independently replicates the regime edge on a fresh instrument**
+(same rules, no tuning). USDJPY/AUDUSD do not carry it — the London
+first-bar entry is mistimed for Asia-driven pairs. Known limitation: BoE/
+BoJ/RBA event blackouts are absent from news_events.csv (USD events cover
+all pairs; EUR covers EURUSD) — flagged, would only worsen UJ/AU further.
+
+Pooled under live constraints (ONE open trade globally, global pacing,
+0.3%/trade on pooled balance):
+
+| Pool | n | PF | folds ≥1.0 | ≥1.25 | min | median | MC P(pass) | P(kill) |
+|---|---|---|---|---|---|---|---|---|
+| all 4 | 2861 | 1.048 | 8/17 | 2/17 | 0.613 | 0.995 | 45.6% | 54.4% |
+| EU+GU | 2150 | 1.086 | **9/17** | 3/17 | 0.660 | **1.002** | 51.5% | 48.5% |
+
+Pooling improves fold consistency (median PF 1.00 vs 0.915 single-pair) but
+LOWERS overall PF vs single-pair EU/GU: the one-open-trade constraint makes
+correlated signals displace each other. Selection per pre-registered rule
+(fold consistency): **EU+GU pool** is the best cycle-2 configuration.
+
+## Cycle-2 verdict — NO-GO, lockbox NOT opened (protocol deviation, documented)
+
+The best configuration fails the gates on design data alone: 3/17 folds
+≥ 1.25 (need all), MC P(pass)=51.5% (need >70%), P(kill)=48.5% (need <10%).
+Opening the lockbox cannot change the verdict and would burn the holdout
+for a config that already failed — deviating from the pre-registered
+"lockbox once" step FOR THAT REASON, the lockbox stays sealed for cycle 2
+(still only ever opened once, in cycle 1, for EURUSD config #1c).
+
+Search size: cycle 2 evaluated 9 further configurations (3 SL widths beyond
+base, 4 per-pair runs, 2 pools). Cumulative across both cycles: 21 configs,
+all logged here.
+
+### Where this leaves the project
+
+Consistent evidence across 21 configurations, 4 instruments, 10 years:
+the H1-regime/London-morning entry has a REAL but SMALL edge
+(≈ +0.10–0.12R gross, ≈ +0.02–0.05R net of realistic costs), replicated
+out-of-family on GBPUSD. The Bootcamp gates need roughly +0.25R net.
+This framework cannot bridge that gap by configuration; it needs either
+(a) structurally lower costs (better broker terms would nearly double net
+expectancy — the strategy is cost-bound, not signal-bound), or
+(b) a second, uncorrelated signal family (e.g. non-London sessions or
+mean-reversion regime complement) to raise pooled expectancy without
+displacement, or (c) accepting that a 50% step-pass probability with zero
+breach risk is simply what this edge is worth — below the bar for a
+funded-account attempt.

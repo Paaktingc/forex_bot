@@ -128,6 +128,13 @@ TRIPLE_BARRIER_TIME_LIMIT = 25
 
 # Backtest cost model (conservative; applied to the rules strategy)
 BACKTEST_SPREAD_FLOOR_PIPS = 0.6      # Recorded/estimated spread floored here
+# Per-symbol conservative raw-spread floors (pips) for multi-pair research
+BACKTEST_SPREAD_FLOOR_BY_SYMBOL = {
+    "EURUSD": 0.6,
+    "GBPUSD": 0.9,
+    "AUDUSD": 0.8,
+    "USDJPY": 0.7,
+}
 BACKTEST_COMMISSION_PER_LOT_RT = 7.0  # USD per standard lot, round trip
 BACKTEST_SLIPPAGE_ENTRY_PIPS = 0.3
 BACKTEST_SLIPPAGE_STOP_PIPS = 1.0
