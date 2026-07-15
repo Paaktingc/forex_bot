@@ -157,3 +157,46 @@ entry_mode=regime_daily, all other production parameters unchanged
 1 trade/day in this mode, all filters, all pacing stops).
 Search size disclosure: 12 configurations evaluated on the design window
 (#0, #1, #1b, #1c, 8 exit variants); zero lockbox contact so far.
+
+---
+
+## Phase 4 — final validation (single pass, config #1c frozen)
+
+**Lockbox (2025-03-20 → 2026-03-20, opened exactly once):**
+111 trades, PF 0.894, WR 26.1%, avg R +0.005, return −2.02%, maxDD 4.97%.
+Lockbox-vs-folds check: PF 0.894 vs design fold median 0.915 → within the
+pre-registered 0.2 band (consistent, i.e. honestly *flat*, not degraded).
+
+**Official `python backtest.py --go-no-go` (full 2015→2026 history):**
+1217 trades, PF 1.081, WR 30.7%, avg R +0.108 (gross), return +16.2%,
+maxDD 11.4%, kill switch never hit on the realized path.
+Walk-forward: 4/19 folds PF ≥ 1.25 (perturbation bands wide, several folds
+robustly < 1.0). MC (20k paths): P(pass)=51.4%, P(kill)=48.6%,
+P(breach −5%)=0.00%, median 129 trades to pass.
+
+| Gate | Required | Result | |
+|---|---|---|---|
+| P(breach −5%) | < 1% | 0.00% | PASS |
+| P(kill switch −3%) | < 10% | 48.6% | FAIL |
+| P(pass +6%) | > 70% | 51.4% | FAIL |
+| PF ≥ 1.25 after costs, every fold | 19/19 | 4/19 | FAIL |
+| Lockbox PF within 0.2 of folds | ≤ 0.2 | 0.02 | PASS |
+
+## VERDICT: NO-GO (final; no further iteration against the lockbox)
+
+The diagnosis is complete and the answer is clear: risk containment is
+proven (the official −5% is unreachable), the H1 regime carries a real but
+small edge (~+0.11R gross, ~+0.01–0.04R net of costs), and no component of
+the pullback framework — trigger, exits, filters — can amplify it to the
+gate level. The edge/cost ratio of a single-instrument EURUSD M15 system at
+8–25-pip stops is the binding constraint.
+
+**Recommended next research direction (not implemented here):**
+1. Multi-instrument pooling (project Lever 1): the regime_daily entry is
+   mechanical and symbol-agnostic; pooling 4–6 uncorrelated majors at the
+   same 0.3% risk multiplies trade count and diversifies fold variance
+   without touching per-trade risk. GBPUSD/USDJPY/AUDUSD M1 data already in
+   m1_data/.
+2. Reduce cost drag structurally: H1-native entries (fewer, wider stops
+   within the 25-pip clamp) cut the spread+commission share of R.
+3. Only after (1)/(2): revisit the gates with the pooled trade stream.
