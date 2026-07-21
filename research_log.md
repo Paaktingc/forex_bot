@@ -436,3 +436,88 @@ P(pass one step) ≈ 0.66 → P(pass 3 Bootcamp steps) ≈ 0.66³ ≈ **29%**, w
 of breaching the official −5%. Expected outcome of a challenge fee at these
 numbers is negative. The GO bar (P(pass)>70% per step, every-fold PF≥1.25)
 remains the right bar, and this strategy does not meet it.
+
+---
+---
+
+# Research cycle 5 (2026-07-16) — multi-instrument transfer test (user plan)
+
+Adopting the user-supplied test plan with two honest amendments, all frozen
+BEFORE any backtest run:
+
+- **Universe & priority:** GRXEUR (DAX proxy) and ETXEUR (EURO STOXX 50
+  proxy) first — session alignment + The5ers indices are commission-free;
+  XAUUSD second (real London prior, metal costs assumed pending MT5 spec
+  freeze); **US30 DEFERRED** — HistData lists no Dow proxy and the clean
+  source (CME DataMine) is unavailable in this environment; running it on
+  a degraded substitute would be data theater. EU/GU history extension to
+  2007–2014 (genuinely unseen years) included as the cheapest evidence.
+- **Fixed-rule transfer:** identical rules, London clock, exits (TP 2R,
+  BE 1R), filters, pacing. NO re-anchoring to local opens, NO per-symbol
+  threshold edits.
+- **Unit mapping (pre-registered, one rule for all non-FX):** pip-based
+  thresholds convert to basis points of price calibrated once from
+  EURUSD@1.10 — SL clamp 8–25 pips → 7.27–22.73 bp; ATR floor 4 pips →
+  3.64 bp; slippage 0.3/1.0/2.0 pips → 0.273/0.909/1.818 bp. Applied at
+  each trade's entry price. FX symbols keep the existing pip rules
+  unchanged.
+- **Costs (instrument-specific, per The5ers help centre):** indices —
+  ZERO commission, spread floors ASSUMED (GRXEUR 1.5 pts, ETXEUR 1.5 pts)
+  pending MT5 spec freeze; XAUUSD — percentage commission ASSUMED at
+  0.002%/side (≈$8/lot RT at $2000) pending MT5 spec freeze; FX unchanged
+  (verified). Any GO-relevant result must be re-frozen against live MT5
+  specs before being believed.
+- **Decision unit = the POOL.** Solo tables are diagnostics only. Augmented
+  pools tested: EU+GU+{GRXEUR}, +{ETXEUR}, +{XAUUSD}, then best-two if any
+  single addition helps. Uplift assessed with a PAIRED day-level moving-
+  block bootstrap (same resampled days for baseline and augmented pool,
+  same seeds) reporting CIs for ΔPF and ΔP(pass). An uplift whose CI
+  straddles zero is not a flip candidate.
+- Gates unchanged. Lockbox (2025-03-20→) stays sealed unless a pooled
+  config passes ALL gates on design data.
+
+## Cycle-5 results
+
+**Data notes (all disclosed):** ETXEUR DROPPED — HistData feed degrades
+2017→2019 and dies after Feb-2020 (16k bars in 2019). GRXEUR feed is
+contaminated with EURO STOXX-scale prices 2020-06-15→2023-12-03 (provider
+switch); only the verified DAX-scale windows are used (clean-window filter
+in prepare_data, 637,761 M1 rows dropped). XAUUSD clean. EU/GU extended to
+2007. US30 deferred (no credible source available).
+
+### Solo transfer tests (design window, fixed rules, class-correct costs)
+
+| Test | n | PF | folds ≥1.0 | median PF | Verdict |
+|---|---|---|---|---|---|
+| **EURUSD 2007–2014 (8 UNSEEN years)** | 1100 | **1.324** | 12/16 | 1.236 | strongest validation yet |
+| **GBPUSD 2007–2014 (UNSEEN)** | 1023 | 1.167 | 12/15 | 1.162 | replicates |
+| **GRXEUR (DAX, clean segments)** | 666 | 1.166 | 11/15 | 1.130 | transfers (3rd instrument) |
+| XAUUSD | 1489 | 0.950 | 10/21 | 0.977 | no transfer — rejected |
+
+### Decisive stage: pooled comparison (design window, paired day-bootstrap)
+
+| Pool | n | PF | folds ≥1.25 | min | med | P(pass) | P(kill) |
+|---|---|---|---|---|---|---|---|
+| BASE EU+GU | 2150 | 1.1645 | 8/21 | 0.727 | 1.147 | 66.4% | 33.6% |
+| AUG EU+GU+DAX | 2501 | 1.1576 | 9/21 | 0.803 | 1.175 | 67.2% | 32.8% |
+
+Paired moving-block day bootstrap (3000 draws, 5-day blocks, same days both
+pools): **ΔPF −0.007, CI95 [−0.054, +0.039]; ΔP(pass) −1.8pp.** The CI
+straddles zero → per the pre-registered rule, DAX addition is NOT adopted.
+Mechanism: all three instruments enter at the same London-morning slot
+under the one-open-trade constraint — they displace, not diversify.
+
+## Cycle-5 verdict
+
+The edge is now validated beyond reasonable doubt: same untouched rules
+profitable on THREE instruments and on EIGHT years of data that did not
+exist during design (2007–2014 EURUSD PF 1.32). But the Bootcamp gate
+math is unchanged: P(pass) ≈ 66–67% (gate >70%), P(kill) ≈ 33% (gate
+<10%), every-fold PF ≥ 1.25 unreachable (8–9 of 21). **NO-GO under the
+frozen gates. Lockbox still sealed since cycle 1.**
+
+The binding constraint is now provably NOT the signal, NOT the costs, and
+NOT the instrument set — it is the strategy's ~one-good-trade-per-morning
+capacity versus a three-step, +6%-per-step gauntlet. 30 configurations
+across 5 cycles all land within a few points of the same step probability.
+That number is the truth about this strategy.

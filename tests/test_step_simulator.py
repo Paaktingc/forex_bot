@@ -211,3 +211,58 @@ class TestEngineExitOverrides:
         assert eng.be_at_r == config.BE_AT_R
         assert eng.tp_r == config.TP_R
         assert eng.sl_atr_mult == config.SL_ATR_MULT
+
+
+class TestBpModeSupport:
+    """Non-FX (cycle 5) basis-point threshold mapping."""
+
+    def _dummy_engine(self, symbol):
+        import backtest
+        import pandas as pd
+        import numpy as np
+
+        idx = pd.date_range("2024-01-01", periods=300, freq="15min", tz="UTC")
+        px = 18000.0 if symbol == "GRXEUR" else 2000.0
+        df = pd.DataFrame({"open": px, "high": px * 1.0002, "low": px * 0.9998,
+                           "close": px, "volume": 1}, index=idx)
+        h1 = df.resample("1h").agg({"open": "first", "high": "max",
+                                    "low": "min", "close": "last", "volume": "sum"})
+        return backtest.RulesBacktestEngine(df, h1, symbol=symbol)
+
+    def test_index_is_commission_free(self):
+        eng = self._dummy_engine("GRXEUR")
+        assert eng.bp_mode is True
+        assert eng._commission_per_lot(18000.0) == 0.0
+
+    def test_metal_percentage_commission(self):
+        eng = self._dummy_engine("XAUUSD")
+        # 2 sides x 0.002% x price x 100 oz = 0.00004 * 2000 * 100 = $8/lot
+        assert eng._commission_per_lot(2000.0) == pytest.approx(8.0)
+
+    def test_bp_clamp_scales_with_price(self):
+        import config
+
+        eng = self._dummy_engine("GRXEUR")
+        price = 18000.0
+        # SL distance below the bp floor -> skipped
+        atr_too_small = price * config.BP_THRESHOLDS["sl_min"] / 1.5 * 0.9
+        assert eng._sl_tp(1, price, atr_too_small, None) is None
+        # mid-clamp ATR -> accepted, TP = 2R
+        atr_ok = price * 0.0010 / 1.5  # 10 bp SL distance
+        out = eng._sl_tp(1, price, atr_ok, None)
+        assert out is not None
+        sl, tp = out
+        assert tp - price == pytest.approx(2.0 * (price - sl), rel=1e-6)
+
+    def test_fx_engine_unaffected(self):
+        import backtest
+        import config
+        import pandas as pd
+
+        df15 = backtest.get_ohlcv_from_csv("EURUSD", "M15").iloc[-2000:]
+        dfh1 = backtest.get_ohlcv_from_csv("EURUSD", "H1")
+        dfh1 = dfh1.loc[dfh1.index >= df15.index[0].floor("h") - pd.Timedelta(days=30)]
+        eng = backtest.RulesBacktestEngine(df15, dfh1)
+        assert eng.bp_mode is False
+        assert eng._commission_per_lot(1.1) == config.BACKTEST_COMMISSION_PER_LOT_RT
+        assert eng._entry_cost(1.1) == pytest.approx(eng.spread + eng.slip_entry)

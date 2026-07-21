@@ -15,6 +15,9 @@ class SymbolSpec:
     min_lot: float
     max_lot: float
     lot_step: float
+    # "fx" symbols use pip-denominated thresholds; other classes use the
+    # basis-point mapping in config.BP_THRESHOLDS (research cycle 5)
+    asset_class: str = "fx"
 
 
 _SPECS: dict[str, SymbolSpec] = {
@@ -53,6 +56,36 @@ _SPECS: dict[str, SymbolSpec] = {
         min_lot=0.01,
         max_lot=5.0,
         lot_step=0.01,
+    ),
+    # Cycle-5 transfer-research symbols (HistData proxies GRX/EUR, ETX/EUR).
+    # pip_value is nominal for the index proxies — R-based backtest math is
+    # insensitive to it; live trading would need real MT5 contract specs.
+    "XAUUSD": SymbolSpec(
+        symbol="XAUUSD",
+        pip_size=0.1,
+        pip_value_per_standard_lot=10.0,  # 100 oz × $0.1
+        min_lot=0.01,
+        max_lot=5.0,
+        lot_step=0.01,
+        asset_class="metal",
+    ),
+    "GRXEUR": SymbolSpec(
+        symbol="GRXEUR",
+        pip_size=1.0,
+        pip_value_per_standard_lot=10.0,
+        min_lot=0.01,
+        max_lot=5.0,
+        lot_step=0.01,
+        asset_class="index",
+    ),
+    "ETXEUR": SymbolSpec(
+        symbol="ETXEUR",
+        pip_size=1.0,
+        pip_value_per_standard_lot=10.0,
+        min_lot=0.01,
+        max_lot=5.0,
+        lot_step=0.01,
+        asset_class="index",
     ),
 }
 

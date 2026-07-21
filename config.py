@@ -137,11 +137,48 @@ BACKTEST_SPREAD_FLOOR_BY_SYMBOL = {
     "GBPUSD": 0.6,
     "AUDUSD": 0.6,
     "USDJPY": 0.5,
+    # non-FX floors are ASSUMED pending MT5 spec freeze (cycle 5):
+    "XAUUSD": 2.5,   # $0.25 (pip = 0.1)
+    "GRXEUR": 1.5,   # 1.5 index points (pip = 1.0)
+    "ETXEUR": 1.5,   # 1.5 index points (pip = 1.0)
 }
 BACKTEST_COMMISSION_PER_LOT_RT = 4.0  # USD per standard lot, round trip (verified)
 BACKTEST_SLIPPAGE_ENTRY_PIPS = 0.3
 BACKTEST_SLIPPAGE_STOP_PIPS = 1.0
 BACKTEST_SLIPPAGE_NEWS_PIPS = 2.0
+
+# ---------------------------------------------------------------------------
+# Non-FX transfer research (research_log.md cycle 5).
+# Pip-denominated thresholds convert ONCE to fractions of price, calibrated
+# from EURUSD @ 1.10 (8 pips = 0.0008/1.10 etc.), applied at each trade's
+# entry price for symbols whose asset_class != "fx". FX behavior unchanged.
+# ---------------------------------------------------------------------------
+BP_THRESHOLDS = {
+    "sl_min": 0.0008 / 1.10,        # 7.27 bp of price  (8 pips)
+    "sl_max": 0.0025 / 1.10,        # 22.73 bp          (25 pips)
+    "atr_min": 0.0004 / 1.10,       # 3.64 bp           (4 pips)
+    "slip_entry": 0.00003 / 1.10,   # 0.273 bp          (0.3 pips)
+    "slip_stop": 0.0001 / 1.10,     # 0.909 bp          (1.0 pips)
+    "slip_news": 0.0002 / 1.10,     # 1.818 bp          (2.0 pips)
+}
+# Index spread floors in points / XAU in pips-of-0.1 — ASSUMED pending a
+# freeze against live The5ers MT5 symbol specifications. Indices carry no
+# commission at The5ers; metals use a percentage commission (rate ASSUMED
+# 0.002%/side pending MT5 spec).
+BACKTEST_COMMISSION_PCT_PER_SIDE_BY_SYMBOL = {
+    "XAUUSD": 0.00002,
+}
+CONTRACT_SIZE_BY_SYMBOL = {
+    "XAUUSD": 100,        # oz per lot
+    "GRXEUR": 1,          # 1 index unit per lot (nominal; cancels in R math)
+    "ETXEUR": 1,
+}
+NEWS_CURRENCIES_BY_SYMBOL = {
+    # European indices react to both ECB and the US majors calendar
+    "GRXEUR": ("EUR", "USD"),
+    "ETXEUR": ("EUR", "USD"),
+    "XAUUSD": ("USD",),
+}
 
 # Paths
 MODEL_PATH = str(MODELS_DIR / "model.pkl")

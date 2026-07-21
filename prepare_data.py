@@ -19,10 +19,20 @@ MIN_M15_BARS = 35_000
 
 # Per-symbol sanity bounds for the 2015–present window
 SYMBOL_BOUNDS: dict[str, tuple[float, float]] = {
-    "EURUSD": (0.90, 1.30),   # 2022 low ≈ 0.9536, 2018 high ≈ 1.2555
-    "GBPUSD": (1.00, 1.65),   # 2022 low ≈ 1.035, 2015 high ≈ 1.59
-    "AUDUSD": (0.54, 0.90),   # 2020 low ≈ 0.551, 2018 high ≈ 0.81
-    "USDJPY": (90.0, 170.0),  # 2016 low ≈ 98.9, 2024 high ≈ 161.9
+    "EURUSD": (0.90, 1.65),      # incl. 2008 high ≈ 1.60 (2007+ archive)
+    "GBPUSD": (1.00, 2.20),      # incl. 2007 high ≈ 2.11
+    "AUDUSD": (0.54, 0.90),      # 2020 low ≈ 0.551, 2018 high ≈ 0.81
+    "USDJPY": (90.0, 170.0),     # 2016 low ≈ 98.9, 2024 high ≈ 161.9
+    "XAUUSD": (900.0, 6500.0),   # 2015 low ≈ 1046; 2026 high ≈ 5597
+    "GRXEUR": (7500.0, 27000.0), # DAX proxy; COVID low ≈ 7969
+    "ETXEUR": (2200.0, 6500.0),  # EURO STOXX 50 proxy, 2020 low ≈ 2300
+}
+
+# HistData feed-contamination guards (research_log.md cycle 5): the GRXEUR
+# archive quotes EURO STOXX-scale prices between 2020-06-15 and 2023-12-03
+# (provider switch). Only the verified-DAX-scale windows are kept.
+SYMBOL_CLEAN_WINDOWS: dict[str, list[tuple[str, str]]] = {
+    "GRXEUR": [("2015-01-01", "2020-06-14"), ("2023-12-04", "2030-01-01")],
 }
 PRICE_MIN, PRICE_MAX = SYMBOL_BOUNDS["EURUSD"]  # legacy aliases
 
@@ -133,6 +143,16 @@ def validate_frame(
 
 def run_pipeline(symbol: str = "EURUSD") -> tuple[pd.DataFrame, pd.DataFrame]:
     df_m1 = load_all_m1_data(symbol)
+    windows = SYMBOL_CLEAN_WINDOWS.get(symbol)
+    if windows:
+        keep = pd.Series(False, index=df_m1.index)
+        for start, end in windows:
+            keep |= (df_m1.index >= pd.Timestamp(start, tz="UTC")) & (
+                df_m1.index <= pd.Timestamp(end, tz="UTC")
+            )
+        dropped = int((~keep).sum())
+        df_m1 = df_m1[keep]
+        print(f"{symbol}: dropped {dropped} contaminated M1 rows outside clean windows")
     df_m15 = resample_ohlcv(df_m1, "15min")
     df_h1 = resample_ohlcv(df_m1, "1h")
     validate_frame(df_m15, df_h1, symbol)

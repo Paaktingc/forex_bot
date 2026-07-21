@@ -742,6 +742,60 @@ class RulesBacktestEngine:
         self.slip_stop = config.BACKTEST_SLIPPAGE_STOP_PIPS * self.pip
         self.slip_news = config.BACKTEST_SLIPPAGE_NEWS_PIPS * self.pip
 
+        # Non-FX transfer research (cycle 5): thresholds/slippage become
+        # fractions of price (config.BP_THRESHOLDS); FX path is unchanged.
+        self.bp_mode = spec.asset_class != "fx"
+        self.asset_class = spec.asset_class
+        self.contract_size = config.CONTRACT_SIZE_BY_SYMBOL.get(self.symbol, 100_000)
+
+    # -- asset-class aware cost/threshold helpers (FX path unchanged) -------
+
+    def _entry_cost(self, price: float) -> float:
+        if self.bp_mode:
+            return self.spread + price * config.BP_THRESHOLDS["slip_entry"]
+        return self.spread + self.slip_entry
+
+    def _stop_slip(self, price: float, near_news: bool) -> float:
+        if self.bp_mode:
+            key = "slip_news" if near_news else "slip_stop"
+            return price * config.BP_THRESHOLDS[key]
+        return self.slip_news if near_news else self.slip_stop
+
+    def _commission_per_lot(self, price: float) -> float:
+        pct = config.BACKTEST_COMMISSION_PCT_PER_SIDE_BY_SYMBOL.get(self.symbol)
+        if pct is not None:  # metals: percentage commission (ASSUMED rate)
+            return 2.0 * pct * price * self.contract_size
+        if self.asset_class == "index":  # The5ers: indices commission-free
+            return 0.0
+        return config.BACKTEST_COMMISSION_PER_LOT_RT
+
+    def _atr_floor_ok(self, atr: float, price: float) -> bool:
+        if self.bp_mode:
+            return atr >= price * config.BP_THRESHOLDS["atr_min"]
+        return atr / self.pip >= config.ATR_MIN_PIPS
+
+    def _sl_tp(self, sig: int, entry: float, atr: float, swing: float | None):
+        """Clamped SL/TP: FX uses compute_sl_tp; bp-mode uses the same
+        formula with the price-relative clamp."""
+        if not self.bp_mode:
+            return compute_sl_tp(
+                sig, entry, atr, swing_price=swing, symbol=self.symbol,
+                sl_atr_mult=self.sl_atr_mult, tp_r=self.tp_r,
+            )
+        anchor = swing if swing is not None else entry
+        sl = anchor - sig * self.sl_atr_mult * atr
+        sl_distance = (entry - sl) * sig
+        if sl_distance <= 0:
+            return None
+        if not (
+            entry * config.BP_THRESHOLDS["sl_min"]
+            <= sl_distance
+            <= entry * config.BP_THRESHOLDS["sl_max"]
+        ):
+            return None
+        tp = entry + sig * self.tp_r * sl_distance
+        return round(sl, 5), round(tp, 5)
+
     def _load_news_events(self) -> pd.DataFrame:
         path = _news_events_path()
         if not path.exists():
@@ -756,7 +810,11 @@ class RulesBacktestEngine:
             return pd.DataFrame(columns=["datetime_utc", "currency"])
         df = df.copy()
         df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
-        currencies = {self.symbol[:3], self.symbol[3:6]}
+        currencies = set(
+            config.NEWS_CURRENCIES_BY_SYMBOL.get(
+                self.symbol, (self.symbol[:3], self.symbol[3:6])
+            )
+        )
         df = df.dropna(subset=["datetime_utc"])
         df = df[df["currency"].astype(str).str.upper().isin(currencies)]
         return df.sort_values("datetime_utc")
@@ -810,7 +868,7 @@ class RulesBacktestEngine:
         be_trigger = entry + d * (self.be_at_r or 0.0) * risk_distance
         hh, ll = -np.inf, np.inf
         commission_r = (
-            config.BACKTEST_COMMISSION_PER_LOT_RT
+            self._commission_per_lot(entry)
             / ((risk_distance / self.pip) * self.pip_value)
         )
 
@@ -821,7 +879,7 @@ class RulesBacktestEngine:
             sl_hit = lows[j] <= cur_sl if d == 1 else highs[j] >= cur_sl
             tp_hit = highs[j] >= tp if d == 1 else lows[j] <= tp
             if sl_hit:
-                slip = self.slip_news if self._news_bar_mask[j] else self.slip_stop
+                slip = self._stop_slip(entry, bool(self._news_bar_mask[j]))
                 exit_price = cur_sl - d * slip
                 reason = "SL"
             elif tp_hit:
@@ -860,12 +918,9 @@ class RulesBacktestEngine:
         self.funnel[stage] = self.funnel.get(stage, 0) + 1
         if not self.collect_diagnostics or sig == 0 or not np.isfinite(atr) or atr <= 0:
             return
-        entry = self._opens[i] + sig * (self.spread + self.slip_entry)
+        entry = self._opens[i] + sig * self._entry_cost(self._opens[i])
         swing_arg = float(swing) if np.isfinite(swing) else None
-        sl_tp = compute_sl_tp(
-            sig, entry, atr, swing_price=swing_arg, symbol=self.symbol,
-            sl_atr_mult=self.sl_atr_mult, tp_r=self.tp_r,
-        )
+        sl_tp = self._sl_tp(sig, entry, atr, swing_arg)
         if sl_tp is None:
             if stage != "sl_clamp":
                 return  # would have been clamp-skipped anyway — not thrown away
@@ -937,7 +992,7 @@ class RulesBacktestEngine:
             d = trade["direction"]
             pnl_pips = (exit_price - trade["entry"]) * d / self.pip
             pnl = pnl_pips * self.pip_value * trade["lot"]
-            pnl -= config.BACKTEST_COMMISSION_PER_LOT_RT * trade["lot"]
+            pnl -= self._commission_per_lot(trade["entry"]) * trade["lot"]
             balance_before = balance
             balance = balance + pnl
             risk = trade["risk_distance"]
@@ -1005,7 +1060,7 @@ class RulesBacktestEngine:
                 tp_hit = highs[i] >= tp if d == 1 else lows[i] <= tp
 
                 if sl_hit:  # conservative: SL before TP when both touch
-                    slip = self.slip_news if self._news_bar_mask[i] else self.slip_stop
+                    slip = self._stop_slip(open_trade["entry"], bool(self._news_bar_mask[i]))
                     _close_trade(open_trade, sl - d * slip, ts, "SL")
                     open_trade = None
                 elif tp_hit:
@@ -1094,7 +1149,7 @@ class RulesBacktestEngine:
 
             atr_median = float(atr_medians[i - 1]) if np.isfinite(atr_medians[i - 1]) else None
             atr_pips = atr / self.pip
-            if not np.isfinite(atr_pips) or atr_pips < config.ATR_MIN_PIPS:
+            if not np.isfinite(atr_pips) or not self._atr_floor_ok(atr, opens[i]):
                 self._record_kill("vol_floor", i, sig, atr, swing)
                 continue
             if atr_median and atr_pips > config.ATR_MAX_MEDIAN_MULT * (atr_median / self.pip):
@@ -1103,12 +1158,9 @@ class RulesBacktestEngine:
 
             # -------- entry --------------------------------------------------
             raw_open = opens[i]
-            entry = raw_open + sig * (self.spread + self.slip_entry)
+            entry = raw_open + sig * self._entry_cost(raw_open)
             swing_arg = float(swing) if np.isfinite(swing) else None
-            sl_tp = compute_sl_tp(
-                sig, entry, atr, swing_price=swing_arg, symbol=self.symbol,
-                sl_atr_mult=self.sl_atr_mult, tp_r=self.tp_r,
-            )
+            sl_tp = self._sl_tp(sig, entry, atr, swing_arg)
             if sl_tp is None:
                 self._record_kill("sl_clamp", i, sig, atr, swing)
                 continue
