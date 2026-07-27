@@ -27,11 +27,11 @@ import pandas as pd
 import backtest
 import config
 import strategy as strategy_module
-from risk_manager import compute_sl_tp
 
 
-def _prepared_engine(d15: pd.DataFrame, dh1: pd.DataFrame) -> backtest.RulesBacktestEngine:
-    eng = backtest.RulesBacktestEngine(d15, dh1)
+def _prepared_engine(d15: pd.DataFrame, dh1: pd.DataFrame,
+                     symbol: str | None = None) -> backtest.RulesBacktestEngine:
+    eng = backtest.RulesBacktestEngine(d15, dh1, symbol=symbol)
     df = eng.df
     eng._opens = df["open"].to_numpy(float)
     eng._highs = df["high"].to_numpy(float)
@@ -57,7 +57,10 @@ def _simulate(eng, entries) -> pd.DataFrame:
         atr = float(atrs[i - 1])
         if not np.isfinite(atr) or atr <= 0:
             continue
-        sl_tp = compute_sl_tp(sig, entry, atr, swing_price=swing)
+        # Symbol-aware clamp: for EURUSD (bp_mode off, default mults) this is
+        # byte-identical to compute_sl_tp(sig, entry, atr, swing_price=swing);
+        # for metals/index it applies the price-relative clamp instead.
+        sl_tp = eng._sl_tp(sig, entry, atr, swing)
         if sl_tp is None:
             continue
         sl, tp = sl_tp
@@ -71,8 +74,9 @@ def _simulate(eng, entries) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def run_ablation(d15: pd.DataFrame, dh1: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    eng = _prepared_engine(d15, dh1)
+def run_ablation(d15: pd.DataFrame, dh1: pd.DataFrame,
+                 symbol: str | None = None) -> dict[str, pd.DataFrame]:
+    eng = _prepared_engine(d15, dh1, symbol=symbol)
     frame = strategy_module.build_signal_frame(eng.df, eng.df_h1, eng.params)
     eng._atrs = frame["atr_14"].to_numpy(float)
 
@@ -85,7 +89,9 @@ def run_ablation(d15: pd.DataFrame, dh1: pd.DataFrame) -> dict[str, pd.DataFrame
     signals = frame["signal"].to_numpy(int)
     opens = eng._opens
     lows, highs = eng._lows, eng._highs
-    entry_cost = eng.spread + eng.slip_entry
+    # Asset-aware entry cost: for FX this is the flat spread+slip scalar; for
+    # bp_mode symbols (metals/index) slippage is a fraction of price.
+    ecost = eng._entry_cost
 
     # (a) regime-only: first in-session bar of each day with a regime
     entries_a = []
@@ -95,7 +101,7 @@ def run_ablation(d15: pd.DataFrame, dh1: pd.DataFrame) -> dict[str, pd.DataFrame
         if day == last_day or not session_ok[i] or regime[i - 1] == 0:
             continue
         sig = int(regime[i - 1])
-        entries_a.append((i, sig, opens[i] + sig * entry_cost, None))
+        entries_a.append((i, sig, opens[i] + sig * ecost(opens[i]), None))
         last_day = day
 
     # (b) regime + limit at the EMA20 zone (no confirmation, no RSI):
@@ -122,7 +128,7 @@ def run_ablation(d15: pd.DataFrame, dh1: pd.DataFrame) -> dict[str, pd.DataFrame
         if sig == 0 or not session_ok[i]:
             continue
         swing = swing_low[i - 1] if sig == 1 else swing_high[i - 1]
-        entries_c.append((i, sig, opens[i] + sig * entry_cost,
+        entries_c.append((i, sig, opens[i] + sig * ecost(opens[i]),
                           float(swing) if np.isfinite(swing) else None))
 
     return {

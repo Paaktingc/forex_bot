@@ -829,3 +829,213 @@ expectancy, not creating a positive one.
 
 **Gates 1–4 not run.** Investigation halted at Gate 0 per protocol, pending
 decision.
+
+---
+
+## STEP 1 (2026-07-27) — feasibility envelope for ablation (a), post-Gate-0
+
+**Question.** Gate 0 killed the XAUUSD basket line. Ablation (a) — regime-only
+entry, first valid in-session bar per day — is the only positive result in this
+repo that survived scrutiny. Before building anything on it: does ANY
+risk-per-trade setting simultaneously give a usable probability of reaching the
+programme target AND hold `P(maxDD > 5%) < 5%`?
+
+**Config.** `research/feasibility_envelope.py`. R series from
+`research_ablation.py` variant (a), unchanged. 20,000 block-bootstrap paths,
+block=10, seed=42. maxDD measured on unabsorbed paths over a 111-trade (1-year)
+horizon. Lockbox 2025-03-20 NOT touched.
+
+**Leakage verification.** The R series comes from the existing bar-by-bar
+walk-forward engine: every indicator is trailing, SL/TP come from the frozen
+production clamp evaluated at the entry bar, exits are walked forward tick-order
+(stop before target). The risk sweep is a fixed a-priori grid, not fitted to
+outcomes. No quantity in this study is estimated from data after the trade it
+is applied to.
+
+### 1a. Reproduction — n matches exactly, R does not
+
+| | logged (Phase 2c) | now |
+|---|---|---|
+| n | 1128 | **1128** |
+| PF | 1.118 | 1.185 |
+| E[R] | +0.064 | +0.0965 |
+
+Entry count reproduces to the trade, so the entry logic is unchanged; the R
+values moved because the exit/cost layer changed after Phase 2 (Cycle 4
+re-verified The5ers costs). **The current numbers are more favourable than the
+logged ones.** Recorded rather than adopted silently; all figures below use the
+current verified cost layer, and the direction of the discrepancy is noted.
+
+Data now extends to 2007 (474,790 M15 bars), not 2015. Design window
+(2015-01 → 2025-03-19) kept as the protocol window; 2007-2025 reported as
+sensitivity only.
+
+### 1b. Is the edge real? (the Gate-2 question, asked of variant (a))
+
+Design window: **E[R] = +0.0965, 95% CI [+0.0197, +0.1744], t = 2.44,
+P(E[R] ≤ 0) = 0.0066.** Block bootstrap agrees ([+0.0185, +0.1774]).
+Full 2007-2025: E[R] = +0.1318, CI [+0.0766, +0.1874], P(E[R] ≤ 0) = 0.000.
+
+**The edge clears a 95% test.** It is the first thing in this repo that has.
+
+### 1c. But it is not stationary
+
+| Subperiod | n | PF | E[R] | 95% CI | P(E[R] ≤ 0) |
+|---|---|---|---|---|---|
+| 2007-2011 | 663 | 1.293 | +0.1501 | [+0.048, +0.253] | 0.002 |
+| 2012-2014 | 436 | 1.384 | +0.1891 | [+0.062, +0.316] | 0.002 |
+| 2015-2017 | 402 | 1.404 | +0.1957 | [+0.065, +0.329] | 0.001 |
+| **2018-2020** | 305 | 1.013 | **+0.0072** | **[−0.136, +0.155]** | **0.463** |
+| **2021-2025** | 427 | 1.139 | **+0.0740** | **[−0.049, +0.200]** | **0.125** |
+
+First half (2015-2019) +0.1459R; second half (2020-2025) +0.0426R. Every
+subperiod from 2018 onward has a confidence interval containing zero.
+
+Counter-evidence, stated for balance: the OLS trend of R on trade index has
+**t = −1.32 — the decay is NOT statistically significant**, 92% of rolling
+250-trade windows are positive, and 8 of 11 years are positive. So "the edge
+is decaying" is not established; what IS established is that the post-2018
+data alone cannot distinguish the edge from zero. Both readings are true.
+
+### 1d. The envelope — Bootcamp (+6% target, −5% static, −3% kill)
+
+| risk/trade | P(pass step 1) | P(kill) | P(breach) | median trades | ~months | **P(maxDD>5%)** | P(all 3 steps) |
+|---|---|---|---|---|---|---|---|
+| 0.15% | 0.901 | 0.099 | 0.0000 | 316 | 34.2 | **0.0022** ✅ | — |
+| 0.18% | 0.857 | 0.143 | 0.0000 | 244 | 26.4 | **0.0088** ✅ | — |
+| 0.20% | 0.829 | 0.171 | 0.0000 | 211 | 22.8 | **0.0199** ✅ | 0.569 |
+| 0.22% | 0.801 | 0.199 | 0.0000 | 184 | 19.9 | **0.0357** ✅ | — |
+| **0.23%** | 0.788 | 0.212 | 0.0000 | 171 | 18.5 | **0.0449** ✅ | — |
+| 0.25% | 0.765 | 0.235 | 0.0000 | 150 | 16.2 | **0.0691** ❌ | 0.447 |
+| **0.30% (current config)** | 0.712 | 0.288 | 0.0000 | 113 | 12.2 | **0.1532** ❌ | 0.361 |
+| 0.50% | 0.575 | 0.425 | 0.0000 | 48 | 5.2 | **0.5462** ❌ | 0.190 |
+| 1.00% | 0.463 | 0.537 | 0.0000 | 15 | 1.6 | **0.9588** ❌ | 0.099 |
+
+`P(reach +6% before ever touching −X)`, Bootcamp step 1, kill switch disabled:
+
+| risk | X=1% | X=2% | X=3% | X=4% | X=5% |
+|---|---|---|---|---|---|
+| 0.20% | 0.465 | 0.699 | 0.829 | 0.904 | 0.945 |
+| 0.25% | 0.410 | 0.626 | 0.765 | 0.851 | 0.906 |
+| 0.30% | 0.365 | 0.571 | 0.712 | 0.803 | 0.867 |
+
+`P(breach) = 0.0000` at every risk level is mechanically correct, not a bug:
+worst single R = −1.296, so at ≤0.30% risk one trade moves ≤0.39% and cannot
+gap the −3% kill through to −5%. The maxDD column is the honest risk measure
+because it does not assume the kill switch fires.
+
+### 1e. High Stakes (10%+5% targets, −10% static, −6% kill)
+
+| risk | P(pass step 1) | median trades | ~months | P(all steps) |
+|---|---|---|---|---|
+| 0.20% | 0.968 | 423 | 45.8 | 0.938 |
+| 0.25% | 0.938 | 321 | 34.7 | 0.884 |
+| 0.30% | 0.903 | 251 | 27.2 | 0.825 |
+
+Confirms the Cycle-6 finding directionally: the symmetric budget suits a thin
+edge far better. It buys completion probability with time, not with less risk —
+the maxDD column is identical (it is a property of the return stream).
+
+### Verdict: STEP 1 PASSED, narrowly — with a hard constraint attached.
+
+A feasibility window exists, and it is **risk ≤ 0.23% per trade**. That is the
+entire window. Above it the strategy fails its own `P(maxDD>5%) < 5%` gate.
+
+**Live config defect found.** `config.PROGRAMMES["bootcamp"]["risk_per_trade_pct"]
+= 0.003` (0.30%) yields **P(maxDD > 5%) = 15.3% — three times over the hard
+gate**. The current default is not compliant with the repo's own standard and
+must come down to ≤0.0023 before any challenge. High Stakes at 0.004 (0.40%)
+is worse still at 35.2%.
+
+**What the window actually buys.** At 0.20% risk: 82.9% chance of passing
+Bootcamp step 1, median **211 trades ≈ 22.8 months**. All three steps: 56.9%,
+on the order of five years. This edge is real and it is compliant, but it is
+too thin to pass a 3-step +6% programme on any timescale a person would call
+a plan.
+
+**Recommendation before Step 2.** Do not start the faithful reimplementation
+yet. The binding constraint is not implementation quality, it is that
++0.0965R × 111 trades/year cannot clear +6% quickly enough at a risk level that
+survives the drawdown gate. The productive next question is trade FREQUENCY,
+not signal quality: (a) carries one entry per day per instrument by
+construction, and the multi-instrument pooling work (Lever 1) is the only route
+that raises trades/year without raising risk/trade. Awaiting decision.
+
+---
+
+## GATE A (2026-07-27) — does ablation (a) replicate per instrument?
+
+**Question.** Lever 1 (pooled multi-instrument) only helps if the added
+instruments carry edge, not just frequency. Run ablation (a) unchanged on each
+of six instruments, design window 2015-01-01 → 2025-03-19 (lockbox 2025-03-20
+untouched). Kill if fewer than 3 have a bootstrap CI on E[R] with a lower bound
+above 0.
+
+**Config.** `research/gate_a_per_instrument.py`. R series from
+`research_ablation.run_ablation` variant (a), unchanged entry logic. The
+ablation was made symbol-aware (surgical): `_prepared_engine`/`run_ablation`
+now thread `symbol=` to `RulesBacktestEngine`, `_simulate` uses the engine's
+own asset-aware `eng._sl_tp`, and variant (a)/(c) entries use `eng._entry_cost`.
+For EURUSD (bp_mode off, default mults) these are byte-identical to the prior
+FX path — **guardrail: EURUSD reproduces n=1128, PF 1.185, E[R] +0.0965 to the
+trade**, confirming the edits are neutral. For metals/index the change applies
+the correct price-relative clamp/cost instead of the EURUSD pip clamp.
+
+**Leakage verification.** R comes from the bar-by-bar walk-forward engine:
+every indicator/threshold is trailing, SL/TP from the frozen entry-bar clamp,
+exits walked forward tick-order (SL before TP). Design window ends before the
+2025-03-20 lockbox, which is not read. Bootstrap resamples the realised R
+vector only — no future information enters.
+
+| Symbol | n | tr/yr | PF | E[R] | iid 95% CI | block 95% CI | P(E[R]≤0) | 2018+ E[R] [CI] | edge? |
+|---|---|---|---|---|---|---|---|---|---|
+| EURUSD | 1128 | 111 | 1.185 | +0.0965 | [+0.0195,+0.1754] | [+0.0172,+0.1759] | 0.0073 | +0.0461 [−0.050,+0.142] | ✅ |
+| GBPUSD | 1547 | 152 | 1.218 | +0.1132 | [+0.0480,+0.1797] | [+0.0450,+0.1830] | 0.0004 | +0.0919 [+0.010,+0.173] | ✅ |
+| AUDUSD | 1104 | 109 | 1.041 | +0.0224 | [−0.0521,+0.0989] | [−0.0534,+0.0978] | 0.2784 | −0.0427 [−0.136,+0.053] | ❌ |
+| USDJPY | 1138 | 112 | 1.043 | +0.0241 | [−0.0531,+0.1022] | [−0.0491,+0.0985] | 0.2688 | −0.0167 [−0.113,+0.079] | ❌ |
+| XAUUSD | 1500 | 148 | 0.968 | −0.0182 | [−0.0835,+0.0480] | [−0.0866,+0.0503] | 0.7046 | −0.0334 [−0.112,+0.046] | ❌ |
+| GRXEUR |  676 |  67 | 1.184 | +0.0987 | [−0.0019,+0.2024] | [+0.0002,+0.1955] | 0.0277 | +0.1076 [−0.019,+0.236] | ❌ (iid straddles 0) |
+
+Only **EURUSD and GBPUSD** clear both bootstrap CI lower bounds above 0.
+GRXEUR is the near-miss: block CI barely clears (+0.0002) but the iid CI
+straddles zero (−0.0019) and it carries the fewest trades (67/yr). AUDUSD and
+USDJPY are indistinguishable from a coin flip (PF ~1.04, P(E[R]≤0) ~0.27).
+XAUUSD is negative on this signal (PF 0.968).
+
+**Pairwise daily-aggregate-R correlation (design window), reported for balance —
+this is the Gate-B question, answered early because it changes how the kill
+reads:**
+
+```
+        EURUSD  GBPUSD  AUDUSD  USDJPY  XAUUSD  GRXEUR
+EURUSD    1.00    0.18    0.13    0.04    0.15    0.09
+GBPUSD    0.18    1.00    0.12    0.02    0.07    0.02
+```
+
+The survivors are **not** correlated (EUR–GBP r = 0.175). So the kill is NOT
+"one trade in six hats" — realized outcomes are near-independent across the
+board (max pairwise 0.18). The kill is narrower and harder: **only two of six
+instruments carry any edge at all.** Pooling the other four raises trades/year
+by importing two coin flips (AUD, JPY) and one losing stream (XAU) — precisely
+the failure the gate was built to catch: "pooling uncorrelated noise raises
+frequency without raising expectancy."
+
+### Verdict: GATE A FAILED — stop.
+
+- **Kill criterion met:** 2 of 6 instruments clear the CI test, below the
+  required 3. Even counting GRXEUR generously (block-only) reaches 3 by one
+  instrument that (i) fails the iid test, (ii) adds the least frequency, and
+  (iii) is a different asset class (index) whose transfer is least established.
+- The two real edges, EUR + GBP, are low-correlation (r=0.18) and would give
+  genuine breadth — but that is two instruments, ~263 combined trades/year, and
+  the protocol threshold is ≥3. Reporting it for the decision, not overriding
+  the gate.
+- **Reading.** The binding constraint identified in Step 1 (frequency, not
+  signal quality) is not relieved by this instrument set. The signal is
+  specific to EUR/European-session USD majors; it does not transfer to AUD, JPY,
+  gold or the DAX. Naive pooling would degrade expectancy, not just fail to
+  raise it.
+
+**Gates B–E not run.** Halted at Gate A per protocol, pending decision. A
+EUR+GBP two-instrument pool is the only configuration the data supports raising
+if the ≥3 threshold is relaxed — that is the user's call, not a workaround.
