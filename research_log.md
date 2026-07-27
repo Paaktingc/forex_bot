@@ -521,3 +521,311 @@ NOT the instrument set — it is the strategy's ~one-good-trade-per-morning
 capacity versus a three-step, +6%-per-step gauntlet. 30 configurations
 across 5 cycles all land within a few points of the same step probability.
 That number is the truth about this strategy.
+
+# Research cycle 6 (2026-07-21) — programme-fit pivot: Bootcamp → High Stakes
+
+Deep-research report: `cycle6_research_report.md` (18 sections, verified
+The5ers rules + literature review + sleeve Monte Carlo). Headline: the
+NO-GO is a **structure** problem, not an alpha problem. Do NOT tune the
+frozen London rules further.
+
+## Key finding — the barrier geometry, not the edge, is the constraint
+
+Bootcamp is an asymmetric +6% / −3%-kill game with a thin (~+0.11R/trade)
+edge. With unlimited time (VERIFIED), pass probability is governed by
+edge/variance vs the barriers — not total return. Two levers move it:
+
+1. **Lower risk** (frozen system only, MODEL): 0.30%→P(pass)~67%; 0.20%
+   ~79%; 0.15%~86%; 0.10%~95% — but 430–770 trading days/stage. Raising
+   risk strictly HURTS (0.60%→52%).
+2. **Wider symmetric barrier** = a different programme.
+
+## High Stakes fits the frozen edge far better (VERIFIED rules 2026-07-21)
+
+2-step, targets 10% then 5%, **static 10%** max loss, 5% daily, ≥3
+profitable days (day closing ≥0.5%), unlimited time, 1:100. A 10%/10%
+symmetric barrier suits a thin positive edge. MODEL (calibrated frozen
+ledger, block-bootstrap through the new programme simulator):
+
+| Programme | Geometry | Risk | P(complete) |
+|---|---|---|---|
+| Bootcamp | 3×(+6) / −5 / −3 kill | 0.30% | ~0.30–0.36 |
+| **High Stakes** | +10,+5 / −10 / −6 kill | 0.40% | **~0.72** |
+
+Per-step High Stakes: step1 P(pass)~0.83 P(kill)~0.17; step2 ~0.86/0.14;
+worst-step kill well under the Bootcamp ~0.29. Same untouched edge.
+
+## Implemented this cycle (code)
+
+- `config.py`: **PROGRAMMES** profile layer (`bootcamp`, `high_stakes`),
+  selected by `PROGRAMME` env var. All barrier/kill/pacing/risk constants
+  now DERIVE from the active profile (backward-compatible aliases kept).
+  High Stakes circuit breakers retuned to the 10% budget: soft-reduce
+  (halve size) at −4%, kill (flatten+disable) at −6%, official backstop
+  −10%; daily pacing 1.5% (inside the official 5%); risk 0.40%;
+  MIN_PROFITABLE_DAYS=3 (profitable day = closed ≥0.5%).
+- `monte_carlo_dd.py`: `run_programme_monte_carlo()` +
+  `run_programme_from_config()` + `print_programme_report()` — chains N
+  steps with per-step geometry, reports per-step P(pass/kill/breach) and
+  full-programme completion. Single-step API unchanged.
+- `risk_manager.py`: profitable-day crediting at each server-day reset,
+  `profitable_days_met()`, and `check_official_daily_loss()` backstop
+  (no-op for Bootcamp). Kill switch / max-loss already followed the config
+  constants, so they became programme-aware for free.
+- `backtest.py --go-no-go`: now also prints the full-programme report and
+  bases the verdict on the WORST per-step probabilities of the active
+  profile.
+- `tests/test_programme_profiles.py`: 9 tests (profiles, MC step math,
+  HS>Bootcamp on identical edge, zero official breach, profitable-day gate,
+  official-daily-loss backstop). Full suite: 233 passed (remaining
+  failures/errors are missing-XGBoost / sandbox-network only).
+
+## How to run
+
+```
+# Bootcamp (default) vs High Stakes go/no-go on the frozen strategy:
+python backtest.py --go-no-go
+PROGRAMME=high_stakes python backtest.py --go-no-go
+```
+
+## Cycle-6 verdict
+
+**Switch the frozen London system to The5ers High Stakes $100K at
+0.30–0.40% risk** (circuit breaker −6%/−8%). Do NOT run Bootcamp at 0.30%.
+Do NOT tune London parameters. Parallel research track (optional): Cycle-6
+NY-ORB-NAS100 sleeve, pre-registered v1.0 in `cycle6_research_report.md`
+§10 — P(GO) ~25–35%; needed only to unlock a Bootcamp portfolio later,
+not required for the High Stakes route. Lockbox still sealed.
+
+# Cycle 6.1 (2026-07-21) — deployment-safety hardening (live/challenge NO-GO fixes)
+
+Pre-deployment audit flagged 7 engineering defects that made live/challenge
+use unsafe REGARDLESS of the strategy edge. All fixed with tests. NOTE: these
+fixes make the bot SAFE TO DEPLOY; they do NOT make the STRATEGY a GO — the
+edge remains NO-GO on Bootcamp under its own gates (PF≥1.25 every fold,
+P(kill)<10%). The legitimate GO route is programme fit (High Stakes) and/or a
+new orthogonal sleeve — not code.
+
+Findings fixed:
+1. **Risk baseline reset on restart (CRITICAL).** `RiskManager.load_or_init()`
+   restores the persisted STEP-START balance from `RISK_STATE_PATH`; a restart
+   after losses no longer moves the −3%/−6% kill anchor down. Daily/weekly
+   baselines + counters persist too. Re-baselining a genuinely new step is a
+   deliberate `main.py --new-step` action, never inferred. `save_state()` is
+   called on every mutation (trade open, result, day rollover).
+2. **Broker closes never reconciled (CRITICAL).** New `reconcile.py`
+   (`classify_closure` pure + `reconcile_closures`) detects journalled-open
+   tickets no longer open at the broker, writes the SL/TP exit, and feeds the
+   result into the consecutive-loss counters. Wired into `main.process_candle`
+   before the counter sync; last-seen P&L snapshot kept in `BotState`.
+3. **News calendar timezone (HIGH).** `config.NEWS_SOURCE_TZ` (IANA) now drives
+   FF time parsing: naive time localized to that zone then converted to UTC,
+   instead of blindly assuming UTC. Verified ET→UTC conversion.
+4. **No evaluation-target stop (HIGH).** `can_trade()` halts and persists a
+   benign passed-step flag once equity reaches the step target AND
+   `profitable_days_met()` (High Stakes ≥3 profitable days). Prevents giving
+   back a qualifying result. Re-arm for the next step with `--new-step`.
+5. **Official daily-loss check was dead code (HIGH).** `check_official_daily_loss()`
+   is now invoked in `can_trade()` (High Stakes 5%; no-op for Bootcamp steps).
+6. **Unfinished cTrader candle (MEDIUM).** New `bar_utils.drop_forming_bar()`
+   excludes the still-forming trendbar in the cTrader adapter, so
+   `generate_candidate` only ever sees closed bars.
+7. **Failed candle not retried (MEDIUM).** `process_candle()` returns a bool;
+   `main` advances `last_candle` only on success, so a transient broker/data
+   failure retries the same candle instead of skipping it.
+
+Tests: `tests/test_deployment_safety.py` (14) + `tests/test_programme_profiles.py`
+(9). Full suite 249 passed; residual failures are missing-XGBoost and a
+sandbox-only news-cache permission artifact — not code defects.
+
+## Deployment gate
+
+Engineering: demo-only until findings 1–5 are exercised on a real
+restart/reconciliation cycle on the target broker (the unit/integration tests
+cover the logic; a live smoke test is still required). Strategy: NO-GO on
+Bootcamp; route to High Stakes (`PROGRAMME=high_stakes`) or add the Cycle-6
+NY-ORB sleeve before any paid challenge.
+
+---
+
+## Side-study — XAUUSD copier teardown (2026-07-27)
+
+Not a config iteration. A third-party XAUUSD-STDc copy-trading account was
+analysed to decide whether any of its behaviour is reusable for Bootcamp.
+Full write-up + datasets + pipeline: `research/xauusd_copier_teardown/`.
+
+**Source material.** 16 daily MT5 statement sheets (account 29498319, USC cent
+account, 29 Jun – 23 Jul 2026) + 6,281,860 Dukascopy XAUUSD ticks (1–26 Jul).
+No same-broker M1/tick export and no symbol specification were supplied; every
+instrument fact below is *derived* from statement arithmetic, not read from MT5.
+
+**Reconstruction quality.** 2,917 order rows / 2,919 deal rows → 2,721 unique
+deals after dropping 196 exact duplicates (Sheet15 re-states Sheet16
+cumulatively). 1,356 round-trip positions matched by implied-entry-price +
+FIFO, with **0.00000 USD error on 100% of matches**; daily closed P/L
+reconciles **exactly on 15 of 16 sheets**. The 16th (7 Jul) differs by
+−95.20 USC, traced to nine orphan closes whose opens sit in a missing 6 Jul
+statement.
+
+**Instrument facts derived.** Contract = **1 troy oz per lot**, P/L in US cents
+(`profit_USC = Δprice × lots × 100`, exact on all 1,356). Leverage **≈1:500**
+(22 Jul EOD: US$11,564.81 notional vs US$23.16 margin → 499.4:1). Digits 2,
+point 0.01, min lot 0.02, step 0.01, commission 0, fee 0, swap net +226.66 USC.
+Server clock **UTC+3**, established by offset grid search against Dukascopy
+(median |price error| 0.235 USD at +3 vs 13.06 at +0) — same class of defect as
+the HistData ET-vs-UTC bug in Phase 1, and worth the same paranoia everywhere.
+
+**Strategy recovered.**
+- Open 0.02 lots (92.8% of 486 baskets), no SL, no TP, market order.
+- Add on ~2.10 USD/oz **adverse** movement (81.5% of 870 additions follow an
+  adverse move); step is flat across levels, not expanding.
+- Ladder `0.02,0.02,0.03,0.04,0.05,0.06,0.08,0.11,0.14,0.18,0.23,0.30,0.39,0.51,0.67,0.87`
+  — **428/486 baskets (88.1%) reproduce it exactly**; ascending transitions fit
+  `round(prev × 1.30, 2)` at 89.8%. Fibonacci (1.618) fits only 19.2%.
+- Close whole basket at ≈ **+2.3 USD/oz from weighted-average entry** (median of
+  439 winners, IQR 1.78–3.01). 84% of baskets close in ≤2 timestamps.
+- Max observed depth 16 levels, max 14.20 lots in one basket, max 9.9 h held.
+
+**Entry signal: not recoverable.** 8 candidate rules tested on 442 basket starts
+against all in-session M1 bars. Best precision 2.61% (fade a 5-min move >8bp)
+against a 1.01% base rate. There *is* a real counter-trend tilt — longs open
+after a median −4.16 bp 5-min move, shorts after +4.67 bp (Mann-Whitney
+p < 0.0001), Bollinger position 0.385 vs 0.613 (p < 0.0001) — but it is far too
+weak to time anything. The trigger lives on the master account.
+
+**The number that matters.** Closed-balance drawdown over the period:
+**0.00%**, 16/16 winning days, 90.3% basket win rate, PF 12.20. Tick-reconstructed
+worst simultaneous floating P/L: **−7,814.97 USC = −7.67% of balance**
+(−5.14% of equity, which included a 50,000 USC credit bonus). Worst single
+basket **−8,465.21 USC = −8.30%**, i.e. **911× the median basket win of 9.29 USC**.
+Median winning basket carried 1.11× its eventual profit in unrealised loss
+before closing.
+
+Analytically, on the fitted 16-level ladder: a **1%** adverse move → −5.8% of
+balance (already past the Bootcamp limit); **2%** → −20.7%; **3%** → −35.6%.
+
+**Statement is survivorship-filtered.** Three ledger discontinuities
+(−1,373.66 / −456.94 / −1,380.28 = **−3,210.88 USC**) show losses on days whose
+statements were not supplied. Real ledger change +12,738.36 vs +15,949.24
+implied by the supplied trades — a **20% overstatement**. Only profitable days
+were provided.
+
+**Bootcamp compliance: 6 hard FAILs, 2 UNCLEAR, 11 PASS.** Disqualifying on
+their own: external signal copying is prohibited (100% of deals are `copy #…`);
+SL mandatory on every position (0/2,721, and 5 no-SL violations terminate an
+account); 5% max loss per step vs −7.67% observed floating; 1:30 leverage vs
+1:500 operating leverage. UNCLEAR: HFT / tick-scalping classification of 160
+orders/day with sub-second 12-order bursts — needs written confirmation.
+
+### Verdict
+
+**NO-GO on the original bot.** Five of the nine standing NO-GO conditions are
+met independently. Its 90.3% win rate *is* its risk — it is produced by refusing
+to realise losses, which is the same pathology as the leakage-driven metrics
+retired in the EURUSD line, only expressed through position management instead
+of through the train/test split.
+
+**REDESIGN REQUIRED** if the basket idea is pursued. Report §10–11 specifies an
+independent variant: locally generated mean-reversion signal (no copier),
+0.25%/basket risk, **bounded arithmetic** ladder 1.0/1.3/1.6/1.9 with max 3
+additions, base lot solved backwards from a fixed `2.0 × ATR_H1` stop, shared
+basket SL written onto **every** ticket, 0.75% daily / 2.0% total internal
+stops, spread and ATR-percentile regime filters, 4-hour max duration, cooldown
+after losses, exit-only degradation on a rejected addition. Explicitly **no**
+geometric Martingale.
+
+Gate before that redesign earns even a demo slot, in order:
+1. **6–12 months of same-broker XAUUSD bid/ask ticks** + a filled-in symbol
+   spec. `research_backtest.py` was run end-to-end on the 26 days available and
+   produced 0/0/1 trades across a 60/20/20 split — the engine works, the data
+   does not exist yet.
+2. The missing 6 Jul, 13–14 Jul and 17→20 Jul statements, to attribute the
+   −3,210.88 USC.
+3. `P(maxDD > 5%) < 5%` on ≥20k Monte Carlo resamples — the same binary gate
+   already applied to the EURUSD line.
+4. Written confirmation from The5ers on the HFT / tick-scalping items.
+
+Until all four clear, the answer stays NO-GO.
+
+---
+
+## GATE 0 (2026-07-27) — stop-loss counterfactual on the XAUUSD copier baskets
+
+**Question.** Was the copier's entire return produced by the deferred-loss
+mechanism? Re-simulate the 442 tick-covered baskets with a hard stop on
+aggregate basket floating P/L. Entries, lot ladder and the ~+2.3 USD/oz
+weighted-average-entry exit are all held identical; the only change is that a
+basket dies when its floating loss reaches the stop.
+
+**Config.** `research/xauusd_copier_teardown/gate0_stop_counterfactual.py`.
+Balance anchor 101,942.72 USC (raw_summary Sheet14, 2026-06-30 EOD ledger).
+Universe = 442 baskets with Dukascopy tick coverage, 2026-07-01 → 2026-07-23.
+Forced-exit cost = worst-side mark (spread already in `min_float`) + 0.10
+USD/oz slippage applied to `total_lots` (pessimistic: charges the full ladder
+even when the stop fires before the last rung).
+
+**Leakage verification.** No parameter is fitted here. The only input is
+`min_float`, which `pipeline/tick_analysis.py` computed forward in time from
+6,281,860 ticks as the running minimum of the basket's aggregate floating P/L
+counting only positions already opened at each second (`live = tsec >= opens`).
+A basket stops iff `min_float <= -stop`, because the path up to the first
+crossing is identical in the counterfactual and the stop merely truncates it.
+The four stop levels are fixed fractions of a balance known at period start,
+not quantiles of the outcome distribution.
+
+| Config | Stopped | Net USC | Net % | WR % | PF | Worst loss | Max DD % |
+|---|---|---|---|---|---|---|---|
+| As traded (no stop) | 0 | +13,911.32 | +13.646 | 90.95 | 12.088 | −882.44 | 0.866 |
+| Stop 0.5% (510 USC) | 19 | −4,233.89 | −4.153 | 87.10 | 0.597 | −651.71 | 4.153 |
+| Stop 1.0% (1,019 USC) | 12 | −4,189.43 | −4.110 | 88.69 | 0.678 | −1,161.43 | 5.453 |
+| Stop 2.0% (2,039 USC) | 6 | −3,284.01 | −3.221 | 89.82 | 0.745 | −2,180.85 | 5.835 |
+| Stop 3.0% (3,058 USC) | 3 | +1,013.70 | +0.994 | 90.50 | 1.104 | −3,200.28 | 3.139 |
+
+Idealised zero-slippage fills change nothing material: −3,769 / −3,798 / −2,990
+/ +1,229 USC at the four levels.
+
+**Verification (rule 6 applied to PF 12.088 and to the size of the swing).**
+- 0.5% counterfactual reconciles exactly: 13,911.32 − 18,145.21 = −4,233.89.
+- The swing comes from 19 of 442 baskets (4.3%). 17 of those 19 were *winners*
+  worth 8,882.07 USC as traded.
+- The deepest-underwater baskets are the *largest winners*. S241 (min_float
+  −8,465.21 = −8.30% of balance) returned +4,021.16 USC — 28.9% of the entire
+  period's profit from one basket that was 8.3% underwater. S042 (−2.15%) →
+  +955.83. Top 10 baskets = 62.8% of net. 217 of 402 winners carried a peak
+  floating loss larger than their eventual profit.
+- 0 of 442 baskets were never underwater.
+- 78 of 441 adjacent basket pairs overlap in time, so the closed-balance max DD
+  above **understates** the true equity drawdown under a stop regime.
+
+**Survivorship adjustment.** Adding back the −3,210.88 USC of ledger
+discontinuities on the unsupplied days (§2.2 of the teardown report) moves the
+four levels to −7.30% / −7.26% / −6.37% / **−2.16%**. The 3% level's profit
+does not survive the known 20% overstatement.
+
+### Verdict: GATE 0 FAILED — stop.
+
+- **Pass criterion ("net positive at a stop of 2% or tighter") is not met**:
+  2% → −3.22%, 1% → −4.11%, 0.5% → −4.15%. Profit factor is below 1.0 at every
+  one of these levels.
+- The only positive cell, 3%, is not a rescue: it is +0.99% on 17 trading days
+  in a single regime, PF 1.104 (below the 1.2 threshold Gate 3 would have
+  applied), it goes to −2.16% once the known survivorship gap is restored, and
+  a 3% single-basket loss consumes 60% of the entire Bootcamp 5% step budget in
+  one trade. It is not a deployable stop level; it is the level at which the
+  stop stops binding.
+- Max DD flips from 0.866% to 5.45–5.84% at the 1–2% stops — i.e. imposing a
+  stop **breaches the 5% Bootcamp limit** rather than protecting against it,
+  because the stop converts hidden floating loss into realised loss without
+  changing the underlying price paths.
+
+**Reading.** The copier's return was the deferred-loss mechanism, in full. The
+90.3% win rate and PF 12.09 were not an edge being harvested; they were losses
+being postponed, and the biggest wins were the baskets that postponed the most.
+Once losses are realised on any schedule tight enough to be compliant, the
+expectancy is negative. No parameter was tuned to rescue this and none will:
+the entry has no demonstrated directional edge (best precision 2.61% vs a 1.01%
+base rate, §5 of the teardown), so the ladder is redistributing a negative
+expectancy, not creating a positive one.
+
+**Gates 1–4 not run.** Investigation halted at Gate 0 per protocol, pending
+decision.
