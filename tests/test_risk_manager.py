@@ -234,12 +234,44 @@ class TestCalculateLotSize:
         lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD")
         assert lot == expected
 
+    # --- broker-step rounding, decoupled from the mutable production default --
+    # These inject an EXPLICIT risk_pct so they validate the rounding mechanics
+    # regardless of config.RISK_PER_TRADE_PCT (which changed from 0.30% to 0.20%
+    # under the now-retired H1 line and must not couple to sizing-mechanics tests).
+    # EURUSD spec: pip 0.0001, pip_value 10/lot, min 0.01, step 0.01, max 5.0.
+
     def test_lot_size_rounds_down_to_broker_step(self, rm):
-        # 26.5-pip SL: raw lot = 30 / 265 ≈ 0.1132 → floors DOWN to 0.11
-        lot = rm.calculate_lot_size(10_000, 1.09735, 1.1000, "EURUSD")
-        raw = 10_000 * config.RISK_PER_TRADE_PCT / (26.5 * 10.0)
-        assert lot == pytest.approx(0.11)
-        assert lot <= raw  # never rounds up
+        # 0.30% example: 26.5-pip SL → raw = 30 / 265 ≈ 0.1132 → floors to 0.11
+        lot = rm.calculate_lot_size(10_000, 1.09735, 1.1000, "EURUSD", risk_pct=0.003)
+        raw = 10_000 * 0.003 / (26.5 * 10.0)
+        assert raw == pytest.approx(0.113207, abs=1e-6)   # (1) raw before rounding
+        assert lot == pytest.approx(0.11)                 # (2) floored DOWN one step
+        assert lot <= raw                                 # (6) never increases risk
+
+    def test_lot_size_floors_exact_step_boundary(self, rm):
+        # (5) floating-point edge: raw is EXACTLY 0.10 (30 / (30*10)); the 1e-12
+        # epsilon must keep it at 0.10, not slip to 0.09.
+        lot = rm.calculate_lot_size(10_000, 1.0970, 1.1000, "EURUSD", risk_pct=0.003)
+        assert lot == pytest.approx(0.10)
+
+    def test_lot_size_below_min_returns_zero(self, rm):
+        # (3) min-lot handling: raw = 1 / (50*10) = 0.002 < 0.01 → 0.0
+        lot = rm.calculate_lot_size(10_000, 1.0950, 1.1000, "EURUSD", risk_pct=0.0001)
+        assert lot == 0.0
+
+    def test_lot_size_clamped_to_broker_max(self, rm):
+        # (4) max-lot handling: raw = 500 / (5*10) = 10.0 → clamped to max 5.0
+        lot = rm.calculate_lot_size(10_000, 1.09950, 1.1000, "EURUSD", risk_pct=0.05)
+        assert lot == pytest.approx(5.0)
+
+    @pytest.mark.parametrize("sl_price", [1.09950, 1.09735, 1.0970, 1.0955, 1.0900])
+    def test_lot_size_rounding_never_increases_risk(self, rm, sl_price):
+        # (6) across SL distances, the floored lot is never above the raw size.
+        risk_pct = 0.003
+        lot = rm.calculate_lot_size(10_000, sl_price, 1.1000, "EURUSD", risk_pct=risk_pct)
+        sl_pips = abs(1.1000 - sl_price) / 0.0001
+        raw = 10_000 * risk_pct / (sl_pips * 10.0)
+        assert lot <= raw + 1e-12
 
     def test_entry_equals_sl_returns_zero(self, rm):
         assert rm.calculate_lot_size(10_000, 1.1000, 1.1000, "EURUSD") == 0.0
