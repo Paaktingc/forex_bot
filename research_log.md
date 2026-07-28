@@ -1,5 +1,46 @@
 # Research log — diagnosing the NO-GO edge (branch `the5ers-bootcamp`)
 
+> # ⛔ INVALIDATION BANNER (2026-07-28) — READ FIRST
+>
+> **Every positive H1-regime result recorded below is INVALIDATED by structural
+> higher-timeframe look-ahead leakage.** `strategy.build_signal_frame` aligned
+> the H1 regime onto M15 with `merge_asof(direction="backward")` on the H1
+> *opening label*, attaching a still-forming H1 bar whose eventual close is
+> future information. See Gate 0 (commit `9b49079`) for the diagnosis and the
+> alignment-fix commit for the correction (`htf_alignment.align_last_closed_bar`,
+> enforcing `H1.available_at = open + 1h <= decision timestamp`).
+>
+> After the fix, the leak-free H1-regime expectancy is **materially negative**:
+> EURUSD −0.1295R (PF 0.79, 1/11 yrs +), GBPUSD −0.1038R, AUDUSD −0.1515R,
+> USDJPY −0.1190R; every 95% CI is below zero. The positive edge lived entirely
+> in ~500 intra-hour "leak-only" entries per pair (E[R] +0.31…+0.48); the
+> legitimate common entries were already negative.
+>
+> **Anything below that used `build_signal_frame`'s regime is not executable
+> evidence.** This includes the design/extended-window results, the lockbox,
+> the ablation, all configs #1–#24, cycles 2–6, Step 1, Gate A, and every Monte
+> Carlo / feasibility / programme-recommendation built on those returns (the MC
+> code is correct; its *input return distribution* is a leakage artifact). The
+> cost reconciliation (+0.0644R vs +0.0965R = costs only) is unaffected and
+> stands. Verdict: **STOP — H1 regime strategy invalidated; strategy retired.**
+>
+> | Item | Reported (leaky) | Leak dependency | Status |
+> |---|---|---|---|
+> | Phase 1–4 walk-forward / folds | PF ~1.08, avg R +0.108 | `build_signal_frame` | INVALIDATED |
+> | Phase 2c ablation (a) | +0.064R (n=1128) | `build_signal_frame` | INVALIDATED |
+> | Configs #1–#9 (regime_daily + exits) | PF up to 1.10 | `build_signal_frame` | INVALIDATED |
+> | Configs #23–#24 (cycle 4 pools) | PF 1.165 | `build_signal_frame` | INVALIDATED |
+> | Cycles 2–3 pooled streams | PF ~1.0–1.16 | `build_signal_frame` | INVALIDATED |
+> | Phase 4 lockbox | PF 0.894, +0.005R | `build_signal_frame` (leaky, overstated) | INVALIDATED |
+> | Step 1 feasibility envelope | +0.0965R, risk≤0.23% | leaky R distribution | INVALIDATED |
+> | Gate A per-instrument | EUR/GBP "edge" | leaky R distribution | INVALIDATED |
+> | All Monte Carlo (`monte_carlo_dd`) on the above | P(pass)/P(kill)/maxDD | invalid input returns | INVALIDATED (code OK) |
+> | Programme recommendations (Bootcamp/High Stakes) | — | derived from invalid MC | INVALIDATED |
+> | Gate 0 stop-counterfactual (XAUUSD copier) | separate line | none | stands (unrelated) |
+> | Cost reconciliation +0.0644↔+0.0965R | costs only | none | stands |
+>
+> Full write-up: `research/h1_regime_invalidation/README.md`.
+
 Protocol: 12-month lockbox = **2025-03-20 → 2026-03-20** (end of data). All
 diagnosis and iteration below uses only data **before 2025-03-20**. The lockbox
 is run once, on the single final configuration, at the very end.
@@ -1137,3 +1178,65 @@ not match the pre-written STOP labels because the failure mode is leakage, which
 they did not anticipate.) Awaiting decision on whether to (a) apply the
 alignment fix and re-baseline the whole line as a leak-free negative result, or
 (b) retire the H1 regime line.
+
+---
+
+## FIX (2026-07-28) — closed-bar H1 alignment; H1 regime strategy retired
+
+**Configuration.** Frozen H1 regime signal (ablation variant (a), entry mode
+`regime_daily`), unchanged parameters, current cost convention (EURUSD 0.4-pip
+floor, $4/lot RT), re-run under the corrected last-closed-H1 alignment.
+
+**Root cause.** Structural higher-timeframe look-ahead: left-labelled H1 bars
+(label = open; close = label + 1h) were merged onto M15 decisions with
+`merge_asof(direction="backward")` on the H1 *label*, so an M15 bar at
+:00/:15/:30 was matched to its own still-forming H1 bar and inherited that
+bar's future close via the `close ≷ EMA` regime test.
+
+**Fix.** New `htf_alignment.align_last_closed_bar` aligns higher-timeframe
+features on closed-bar availability (`available_at = open + timeframe`,
+`merge_asof` on availability, `allow_exact_matches=True`). Wired into
+`strategy.build_signal_frame` and `features.add_h1_trend` (the same leak in the
+retired ML feature matrix). Invariant enforced: *at decision timestamp t, only
+H1 bars with close ≤ t may be used.*
+
+**Numbers (leak-free, variant (a), current costs).**
+
+| Pair | n | E[R] | PF | iid 95% CI | leaky E[R] |
+|---|---|---|---|---|---|
+| EURUSD | 1108 | **−0.1295** | 0.794 | [−0.205, −0.054] | +0.0965 |
+| GBPUSD | 1530 | **−0.1038** | 0.828 | [−0.168, −0.040] | +0.1132 |
+| AUDUSD | 1098 | **−0.1515** | 0.753 | [−0.225, −0.077] | +0.0224 |
+| USDJPY | 1133 | **−0.1190** | 0.807 | [−0.192, −0.044] | +0.0241 |
+
+EURUSD Window A 2015-01→2025-03: n=1108, E[R] −0.1295, PF 0.794, 1/11 years
+positive. EURUSD Window B 2007→2025: n=2210, E[R] −0.0917, PF 0.850, 4/19
+positive. Entry-set decomposition (EURUSD, Window A): common=585 (E[R] −0.099),
+leak-only=543 (E[R] **+0.307**, the false edge), honest-only=523 (E[R] −0.164).
+The positive edge was entirely the intra-hour leak-only entries.
+
+**Cost reconciliation (unchanged, unrelated to the leak).** +0.0644R (0.6-pip/$7)
+vs +0.0965R (0.4-pip/$4) on the identical 1,128 leaky entries = costs only:
+commission $7→$4 +0.0268R (83.5%), spread 0.6→0.4 +0.0053R (16.5%). Stands.
+
+**Verdict.**
+```
+STOP — H1 regime strategy invalidated by structural higher-timeframe look-ahead leakage. After correcting the alignment, expectancy is materially negative across EURUSD, GBPUSD, AUDUSD and USDJPY.
+```
+
+**Status.**
+- Strategy retired: `strategy.assert_live_entry_mode_enabled` blocks
+  `regime_daily`/`regime_daily2` at `main.initialize_bot` before any broker
+  connection; research reproduction stays open via `build_signal_frame` /
+  `research_ablation` / the backtest engine.
+- Historical dependent results invalidated (banner + table at top of this file).
+- Second same-class leak fixed: `features.add_h1_trend` (retired ML feature
+  matrix; not the production rules path).
+- Mandatory anti-leakage tests added (`tests/test_htf_alignment.py`,
+  `tests/test_regime_alignment_leakage.py`, `tests/test_strategy_retirement.py`).
+- No rescue optimisation performed. New research must start from a separate
+  hypothesis.
+- Separately noted (NOT part of this task): `tests/test_risk_manager.py::
+  test_lot_size_rounds_down_to_broker_step` fails on the working tree because an
+  earlier uncommitted `config.py` change set `risk_per_trade_pct` 0.003→0.002;
+  the test hard-codes the old 0.3%. Unrelated to the leakage fix.
