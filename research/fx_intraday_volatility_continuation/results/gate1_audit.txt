@@ -1,0 +1,51 @@
+========================================================================================
+GATE 1 — data & timestamp audit (M15, four FX pairs)
+========================================================================================
+
+EURUSD: 2007-01-02 01:00:00+00:00 .. 2026-03-20 19:45:00+00:00  n=474790
+  tz=UTC  monotonic=True  dups=0
+  nulls=0  impossible_OHLC=0
+  pip_size=0.0001 pip_value/lot=10.0 (USDJPY scaling OK)
+  spread source=model floor 0.4 pip (no spread column in CSV)
+  intraday gaps >15m: 1756 (weekend-ish 1172); largest 3 days 03:15:00
+  coverage: {'discovery': 298317, 'validation': 99599, 'locked_oos(count only)': 76874}
+
+GBPUSD: 2007-01-02 01:00:00+00:00 .. 2026-05-29 20:45:00+00:00  n=479452
+  tz=UTC  monotonic=True  dups=0
+  nulls=0  impossible_OHLC=0
+  pip_size=0.0001 pip_value/lot=10.0 (USDJPY scaling OK)
+  spread source=model floor 0.6 pip (no spread column in CSV)
+  intraday gaps >15m: 1783 (weekend-ish 1191); largest 3 days 03:15:00
+  coverage: {'discovery': 298302, 'validation': 99587, 'locked_oos(count only)': 81563}
+
+AUDUSD: 2015-01-01 18:00:00+00:00 .. 2026-05-29 20:45:00+00:00  n=280637
+  tz=UTC  monotonic=True  dups=0
+  nulls=0  impossible_OHLC=0
+  pip_size=0.0001 pip_value/lot=10.0 (USDJPY scaling OK)
+  spread source=model floor 0.6 pip (no spread column in CSV)
+  intraday gaps >15m: 1301 (weekend-ish 750); largest 3 days 03:15:00
+  coverage: {'discovery': 99484, 'validation': 99572, 'locked_oos(count only)': 81581}
+
+USDJPY: 2015-01-01 18:00:00+00:00 .. 2026-05-29 20:45:00+00:00  n=280678
+  tz=UTC  monotonic=True  dups=0
+  nulls=0  impossible_OHLC=0
+  pip_size=0.01 pip_value/lot=6.5 (USDJPY scaling OK)
+  spread source=model floor 0.5 pip (no spread column in CSV)
+  intraday gaps >15m: 1314 (weekend-ish 760); largest 3 days 03:15:00
+  coverage: {'discovery': 99483, 'validation': 99619, 'locked_oos(count only)': 81576}
+
+----------------------------------------------------------------------------------------
+Causality confirmations:
+  1. M15 bars are LEFT-labelled (index = OPEN). Proof: an H1 resample's open
+     equals the first constituent M15 open; a bar labelled t covers [t,t+15m).
+  2. A bar labelled t becomes AVAILABLE at its close t+15m (decision time).
+  3. Signals are read at bar close; entry is the NEXT bar's open (backtest.py).
+  4. No higher-timeframe features are attached before close: this study uses
+     M15-native features only; the M30 robustness resample is left-labelled and
+     any cross-TF use goes through align_last_closed_bar (htf_alignment).
+  5. USDJPY pip_size=0.01 (2-dp quote) — stop distances scale correctly.
+  Lockbox: prepare_data.load_split('*','locked_oos') raises LockboxViolation
+     unless unlock_oos=True; discovery/validation cannot touch 2023+.
+
+Kill criteria: all four pairs have clean, monotonic, non-duplicated,
+null-free, tz-aware timestamps and enforce the split -> GATE 1 PASS.
