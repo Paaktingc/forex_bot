@@ -1039,3 +1039,101 @@ frequency without raising expectancy."
 **Gates B–E not run.** Halted at Gate A per protocol, pending decision. A
 EUR+GBP two-instrument pool is the only configuration the data supports raising
 if the ≥3 threshold is relaxed — that is the user's call, not a workaround.
+
+---
+
+## GATE 0 (2026-07-28) — reproduce & reconcile EURUSD H1 regime; LEAKAGE FOUND
+
+**Scope.** Phase-1 signal-validation: reproduce the frozen H1 regime signal
+(ablation variant (a), first eligible in-session bar/day), reconcile the
++0.064R↔+0.0965R history, and check look-ahead before any cross-market test.
+Scripts: `research/gate0_reconcile.py`, `research/gate0_leakage_probe.py`,
+`tests/test_regime_alignment_leakage.py`.
+
+### 1. Reproduction (current cost, CURRENT alignment) — both windows exact
+- **Window A 2015-01→2025-03:** n=**1128** (exact), E[R] **+0.0965**, med −0.149,
+  sd 1.329, WR 31.5%, PF 1.185, maxDD 23.8R, longest losing streak 18,
+  111/yr, **8/11 years positive**. iid95% [+0.020,+0.175], block95% [+0.018,+0.176].
+  Long n=558 +0.138R (PF 1.273); short n=570 +0.056R (PF 1.104).
+- **Window B 2007-01→2025-03:** n=**2233** (exact), E[R] **+0.1318**, WR 32.7%,
+  PF 1.257, 123/yr, **15/19 years positive**. iid95% [+0.076,+0.187].
+- Both reproduce their targets to the trade. Windows reported separately.
+
+### 2. +0.064R vs +0.0965R — fully reconciled to the Cycle-4 cost change
+Held the 1,128 entries and directions fixed (n=1128 in every cell — the cost
+model does not touch the entry set, because the SL clamp is on ATR distance,
+not entry price). Cost layer is the ONLY difference (exit params byte-identical
+between commit af4e876 and HEAD).
+
+| spread / commission | E[R] | PF |
+|---|---|---|
+| 0.6 pip / $7 RT (pre-Cycle-4) | **+0.0644** | 1.118 |
+| 0.4 pip / $4 RT (Cycle-4 verified, current) | **+0.0965** | 1.185 |
+| 0.6 pip / $4 RT | +0.0912 | 1.173 |
+| 0.4 pip / $7 RT | +0.0697 | 1.129 |
+
+Additive decomposition of the +0.0321R gap: **commission $7→$4 = +0.0268R
+(83.5%)**, spread 0.6→0.4 pip = +0.0053R (16.5%); the two effects sum exactly
+(no interaction). The historical discrepancy is 100% cost, 0% signal, exactly
+as pre-diagnosed. Not a reproduction failure.
+
+### 3. LEAKAGE — the H1→M15 regime alignment reads a not-yet-closed bar
+The H1 CSVs are **left-labelled** (bar `o` spans [o, o+1h), closes at o+1h;
+verified: H1 open=first M15 open, H1 close=last M15 close in the window).
+`strategy.build_signal_frame` aligns regime with `merge_asof(direction=
+"backward")` on the H1 **label**, so an M15 bar at :00/:15/:30 is matched to the
+H1 bar **containing** it — still forming, closing up to 45 min in the future.
+Its regime uses `close ≷ ema_fast` on that future close.
+
+Concrete instance (verified): M15 2015-01-05 09:15 is matched to H1 label 09:00,
+which covers [09:00,10:00) and closes at 10:00 — after the M15 bar. The last H1
+bar actually closed by 09:15 is the 08:00 bar. Production uses the forming bar.
+
+**Honest alignment** = regime of the most recent H1 bar CLOSED by the entry
+bar's timestamp (align on close time = label+1h). Variant (a), Window A:
+
+| pair | leaky n | leaky E[R] | leaky PF | honest n | honest E[R] | honest PF | honest iid95% |
+|---|---|---|---|---|---|---|---|
+| EURUSD | 1128 | +0.0965 | 1.185 | 1100 | **−0.1223** | 0.805 | [−0.197,−0.046] |
+| GBPUSD | 1547 | +0.1132 | 1.218 | 1505 | **−0.1164** | 0.812 | [−0.180,−0.051] |
+| AUDUSD | 1104 | +0.0224 | 1.041 | 1071 | **−0.1141** | 0.812 | [−0.190,−0.037] |
+| USDJPY | 1138 | +0.0241 | 1.043 | 1107 | **−0.1291** | 0.791 | [−0.203,−0.054] |
+
+**Localisation of the edge (EURUSD, variant (a) entries split by bar):**
+- common-bar entries (present under both alignments), n=634: E[R] **−0.1216**
+- leak-only entries (intra-hour, created by the forming-bar look-ahead), n=499:
+  E[R] **+0.3737**
+- honest-only entries, n=467: E[R] −0.1232
+
+The entire positive expectancy is carried by the 499 intra-hour entries whose
+regime label already "knows" the direction its own H1 bar will close in. Remove
+the look-ahead and every pair is significantly negative, CI entirely below 0.
+Spot-check confirmed the alignment logic: 100/100 top-of-hour entry bars agree
+leaky==honest (as required — those legitimately use the just-closed bar).
+
+### Verdict: GATE 0 FAILED — leakage found. STOP.
+Per the Gate-0 fail criteria ("Fail if leakage is found"): the frozen H1 regime
+signal's positive expectancy is a look-ahead artifact of the `merge_asof`
+regime alignment, not an edge. It is **structural, not EURUSD-specific** — the
+same mechanism makes all four FX pairs significantly negative once corrected.
+This retroactively explains the positive design-window numbers across the prior
+cycles (all used `build_signal_frame`) and is consistent with the flat/negative
+lockbox (Phase 4: PF 0.894), which was itself leaky and therefore *over*stated.
+
+**Gate 1, binding-cap diagnostic, and the Phase-1 decision options are moot**
+(there is no honest edge to replicate). Documented, not rescued: no parameter
+tuned, no pair removed, no exit altered.
+
+**Not applied, pending decision:** the fix is a production change to
+`strategy.build_signal_frame` (align regime on H1 close time / last closed bar),
+which flips the strategy from "candidate" to negative and changes live
+behaviour. `tests/test_regime_alignment_leakage.py` encodes the no-look-ahead
+invariant (xfail(strict) now; flips to pass when the alignment is fixed).
+
+### Decision memo
+`STOP — the H1 regime signal has no honest edge on EURUSD or any of the four FX
+pairs; the reproduced +0.0965R/+0.1318R are look-ahead artifacts.` (This does
+not match the pre-written STOP labels because the failure mode is leakage, which
+they did not anticipate.) Awaiting decision on whether to (a) apply the
+alignment fix and re-baseline the whole line as a leak-free negative result, or
+(b) retire the H1 regime line.
