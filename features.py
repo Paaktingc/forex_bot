@@ -462,37 +462,30 @@ def compute_session_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_h1_trend(df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> pd.DataFrame:
     """
-    Aligns H1 EMA(50) backwards to M15 timeframe to determine trend.
+    Aligns H1 EMA(50) onto the M15 timeframe to determine trend.
     +1 if H1 close > H1 EMA50, else -1.
+
+    Leak-free alignment: H1 bars are left-labelled, so their close/EMA are only
+    known at label + 1h. align_last_closed_bar attaches the most recently CLOSED
+    H1 bar to each M15 timestamp (see htf_alignment / research_log.md Gate 0).
+    Previously this used merge_asof(direction="backward") on the H1 label, which
+    attached the still-forming H1 bar (future close) — the same structural leak
+    that invalidated the H1 regime strategy.
     """
+    from htf_alignment import align_last_closed_bar
+
     df_h1_out = df_h1.copy()
     df_h1_out["EMA_50"] = _ema(df_h1_out["close"], 50)
     if df_h1_out["EMA_50"].isna().all():
         df_h1_out['EMA_50'] = df_h1_out['close']
-    
-    m15_reset = df_m15.reset_index()
-    h1_reset = df_h1_out.reset_index()
-    
-    # Normalize reset-index datetime column names for merge_asof.
-    if 'time' not in m15_reset.columns:
-        first_col = m15_reset.columns[0]
-        m15_reset = m15_reset.rename(columns={first_col: 'time'})
-    if 'time' not in h1_reset.columns:
-        first_col = h1_reset.columns[0]
-        h1_reset = h1_reset.rename(columns={first_col: 'time'})
-        
-    merged = pd.merge_asof(
-        m15_reset.sort_values('time'),
-        h1_reset[['time', 'close', 'EMA_50']].sort_values('time'),
-        on='time',
-        direction='backward',
-        suffixes=('', '_h1')
+
+    aligned = align_last_closed_bar(
+        df_m15.index, df_h1_out[["close", "EMA_50"]], columns=["close", "EMA_50"]
     )
-    
-    # Add h1_trend: +1 if H1 close > H1 EMA50, else -1
-    merged['h1_trend'] = np.where(merged['close_h1'] > merged['EMA_50'], 1, -1)
-    
-    merged.set_index('time', inplace=True)
+    merged = df_m15.copy()
+    merged["close_h1"] = aligned["close"].to_numpy()
+    merged["EMA_50"] = aligned["EMA_50"].to_numpy()
+    merged["h1_trend"] = np.where(merged["close_h1"] > merged["EMA_50"], 1, -1)
     return merged
 
 def build_feature_matrix(df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> pd.DataFrame:

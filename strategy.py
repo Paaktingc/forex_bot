@@ -33,6 +33,7 @@ from features import (
     compute_regime_indicators_h1,
     rolling_swing_levels,
 )
+from htf_alignment import align_last_closed_bar
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +154,13 @@ def build_signal_frame(
         else _wilder_rsi(close, params.rsi_period)
     )
 
-    # H1 regime and last-H1-swing retracement zone, aligned backward onto M15
+    # H1 regime and last-H1-swing retracement zone, aligned onto M15 using
+    # CLOSED-bar availability. H1 bars are left-labelled (label = open time), so
+    # their features are only known at label + 1h. Aligning on the label with a
+    # backward merge_asof would attach a still-forming H1 bar (whose eventual
+    # close is future information) — the structural look-ahead leak documented
+    # in research_log.md (Gate 0). align_last_closed_bar enforces
+    # `H1.available_at (= open + timeframe) <= M15 decision timestamp`.
     regime_h1 = h1_regime(df_h1, params)
     swings_h1 = rolling_swing_levels(df_h1, params.swing_window_h1)
     h1_frame = pd.DataFrame(
@@ -163,12 +170,7 @@ def build_signal_frame(
             "swing_low_h1": swings_h1["swing_low"],
         }
     )
-    aligned = pd.merge_asof(
-        pd.DataFrame(index=m15.index).reset_index(names="time"),
-        h1_frame.reset_index(names="time").sort_values("time"),
-        on="time",
-        direction="backward",
-    ).set_index("time")
+    aligned = align_last_closed_bar(m15.index, h1_frame)
     regime = aligned["regime"].fillna(0).astype(int)
     swing_high_h1 = aligned["swing_high_h1"]
     swing_low_h1 = aligned["swing_low_h1"]
