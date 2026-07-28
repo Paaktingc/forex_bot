@@ -1240,3 +1240,73 @@ STOP — H1 regime strategy invalidated by structural higher-timeframe look-ahea
   test_lot_size_rounds_down_to_broker_step` fails on the working tree because an
   earlier uncommitted `config.py` change set `risk_per_trade_pct` 0.003→0.002;
   the test hard-codes the old 0.3%. Unrelated to the leakage fix.
+
+---
+
+# NEW LINE (2026-07-29) — FX intraday volatility-expansion continuation
+
+Independent research line. Inherits nothing from the retired H1 regime strategy
+or the XAUUSD basket. Package: `research/fx_intraday_volatility_continuation/`.
+Full write-up: that folder's `README.md`.
+
+**Hypothesis.** After a genuine intraday volatility expansion during London /
+London–NY overlap hours, price tends to continue in the expansion direction over
+the next 1–4h, after realistic costs.
+
+## GATE 1 (2026-07-29) — data & timestamp audit — PASS
+
+Four M15 FX datasets: EURUSD/GBPUSD 2007→2026, AUDUSD/USDJPY 2015→2026. All UTC,
+left-labelled, monotonic, zero duplicates/nulls/impossible-OHLC. USDJPY pip 0.01
+(correct scaling). No spread column → spreads modelled from repo floors
+(0.4/0.6/0.6/0.5 pip). Splits locked: discovery 2007-2018, validation 2019-2022,
+locked OOS 2023→ (sealed by `load_split(..., unlock_oos=…)`). **Leakage check:**
+M15 left-labelled, decision at bar close, entry next-bar open; ATR reference
+excludes the current bar; no HTF feature attached before its close. Causality
+tests in `tests/research/test_intraday_volatility_continuation.py` (12, all pass).
+Verdict: **PASS.** Artifact: `results/gate1_audit.txt`.
+
+## GATE 2 (2026-07-29) — frozen signal
+
+ATR(20) ref through t−1; expansion TR≥1.5×ATR_ref; direction=body sign; close
+location ≥0.75; breakout beyond prior-8 high/low (current excluded); session
+08:00–16:00 London (DST-aware); 4h cooldown; entry next-bar open + spread+slip;
+stop 1.0×ATR_ref; target 1.5R; 16-bar time exit; same-bar stop-first. Frozen in
+`config.py` before any result; not tuned afterwards.
+
+## GATE 3 (2026-07-29) — discovery-window test — FAIL
+
+Discovery 2007-2018 (AUD/JPY 2015-2018), after-cost.
+
+| Pair | n | E[R] net | E[R] gross | PF | WR | iid 95% CI |
+|---|---|---|---|---|---|---|
+| EURUSD | 4107 | −0.1819 | −0.0470 | 0.751 | 0.380 | [−0.221,−0.143] |
+| GBPUSD | 3959 | −0.2363 | −0.1057 | 0.682 | 0.350 | [−0.275,−0.197] |
+| AUDUSD | 1232 | −0.3378 | −0.1280 | 0.586 | 0.338 | [−0.408,−0.269] |
+| USDJPY | 1257 | −0.3784 | −0.1645 | 0.547 | 0.329 | [−0.447,−0.310] |
+
+Pooled 4-pair **−0.2439R** (PF 0.678, iid CI [−0.269,−0.220]); non-EURUSD
+**−0.2834R**. Negative in every pair and nearly every year; removing best
+pair/year does not help; winners diffuse (top 1% = 1.0% of gross wins). Frequency
+~1320 trades/yr.
+
+**Baselines.** matched-random pct-rank 11.3 (P(random≥strategy)=0.887 — the
+signal is *worse* than random-matched entries); shuffled-label P=0.062 (not beaten
+at 95%); unconditional session continuation −0.2581 (signal adds only +0.014R).
+**Diagnosis (no bug):** random in-session entry is fair (−0.008R gross); the
+expansion bar's raw edge is +0.025R gross *at the signal bar* but intrabar — a
+realistic next-bar entry erodes it to −0.047R gross and costs bury it to −0.18R
+net. Post-expansion elevated volatility makes the 1.0×ATR stop hit more than the
+1.5R target (WR<0.40 breakeven).
+
+**Leakage check.** Frozen signal is causal (ATR ref excludes current bar; breakout
+uses prior-8 only; truncation-invariant; next-bar entry) — verified by tests.
+The negative result is genuine, not a leak.
+
+### Verdict
+```
+STOP — volatility-expansion continuation has no directional edge
+```
+Gate 3 failed: pooled after-cost non-positive, non-EURUSD negative, loses to
+matched-random, not above shuffled-label at 95%. Gates 4–5 NOT opened; locked OOS
+(2023→) NOT touched. No parameter search, no rescue. New research must start from
+a separate hypothesis. Artifacts: `results/gate3_discovery.txt`, `test_registry.csv`.
