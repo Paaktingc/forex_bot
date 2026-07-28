@@ -44,6 +44,35 @@ ATR_MEDIAN_WINDOW_BARS = 20 * _BARS_PER_DAY_M15
 RETRACEMENT_SHALLOW = 0.382
 RETRACEMENT_DEEP = 0.618
 
+# --- Strategy retirement registry -------------------------------------------
+# The H1 regime strategy (entry modes below) is INVALIDATED by structural
+# higher-timeframe look-ahead leakage (research_log.md Gate 0 / commit 9b49079
+# and the alignment-fix commit). With leak-free closed-bar alignment its
+# expectancy is materially NEGATIVE across EURUSD/GBPUSD/AUDUSD/USDJPY, so it
+# must never emit a live or demo signal. Research reproduction stays available
+# through build_signal_frame / research_ablation / the backtest engine, which
+# do NOT pass through this guard.
+RETIRED_ENTRY_MODES = frozenset({"regime_daily", "regime_daily2"})
+
+
+class RetiredStrategyError(RuntimeError):
+    """Raised when a retired strategy is enabled for live/demo trading."""
+
+
+def assert_live_entry_mode_enabled(entry_mode: str) -> None:
+    """Fail fast if a retired strategy is configured for live/demo trading.
+
+    Called at bot startup (main.initialize_bot). Research/backtest paths do not
+    call this, so historical reproduction remains possible.
+    """
+    if entry_mode in RETIRED_ENTRY_MODES:
+        raise RetiredStrategyError(
+            f"entry_mode {entry_mode!r} is RETIRED: invalidated by higher-"
+            "timeframe look-ahead leakage; leak-free expectancy is negative "
+            "across all tested FX pairs. It must not trade live or demo. See "
+            "research/h1_regime_invalidation/README.md and research_log.md."
+        )
+
 
 @dataclass(frozen=True)
 class StrategyParams:

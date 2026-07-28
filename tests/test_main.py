@@ -75,6 +75,9 @@ def test_initialize_bot_rules_only(mock_connect, capsys, monkeypatch):
     import config
 
     monkeypatch.setattr(config, "USE_META_VETO", False)
+    # The default ENTRY_MODE (regime_daily) is retired; use a non-retired mode
+    # to exercise broker/risk startup.
+    monkeypatch.setattr(config, "ENTRY_MODE", "pullback_rsi", raising=False)
     mock_connect.return_value = 10_000.0
 
     state = initialize_bot(dry_run=True)
@@ -95,6 +98,7 @@ def test_initialize_bot_survives_missing_meta_model(mock_connect, monkeypatch):
     import config
 
     monkeypatch.setattr(config, "USE_META_VETO", True)
+    monkeypatch.setattr(config, "ENTRY_MODE", "pullback_rsi", raising=False)
     mock_connect.return_value = 10_000.0
 
     with patch("model.MetaVeto.load", side_effect=FileNotFoundError("no model")):

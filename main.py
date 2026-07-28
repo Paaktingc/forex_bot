@@ -23,6 +23,7 @@ import config
 import data_feed
 import execution
 import news_filter
+import reconcile
 import strategy
 import trade_journal
 from symbol_specs import get_symbol_spec
@@ -59,6 +60,9 @@ class BotState:
     meta_veto: Optional[Any] = None  # model.MetaVeto when USE_META_VETO
     params: strategy.StrategyParams = field(default_factory=strategy.StrategyParams)
     is_running: bool = True
+    # Last-seen floating P&L per open ticket, captured each loop so a
+    # broker-side SL/TP close can be classified on the next loop (Finding 2).
+    last_profit_by_ticket: dict = field(default_factory=dict)
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -72,19 +76,32 @@ def get_current_m15_time() -> datetime:
 
 # ── Initialize ────────────────────────────────────────────────
 
-def initialize_bot(dry_run: bool = False) -> BotState:
+def initialize_bot(dry_run: bool = False, new_step: bool = False) -> BotState:
     """
     Connects to the configured broker, creates the RiskManager, optionally
     loads the MetaVeto model, prints a startup banner, and returns BotState.
+
+    The RiskManager baseline is RESTORED from RISK_STATE_PATH so a restart
+    after losses cannot move the kill-switch anchor (Finding 1). Pass
+    new_step=True (CLI --new-step) to deliberately re-baseline to the current
+    broker balance when starting a fresh challenge step / account.
     """
     from risk_manager import RiskManager
 
-    # 1. Connect to broker and obtain starting balance
-    starting_balance = data_feed.connect_broker()
-    logger.info(f"Connected to {config.BROKER} — starting balance: {starting_balance}")
+    # 0. Retirement guard — refuse to start with an invalidated strategy BEFORE
+    #    touching the broker. The H1 regime strategy (regime_daily/2) is retired
+    #    for look-ahead leakage; leak-free expectancy is negative on every
+    #    tested FX pair (research/h1_regime_invalidation/README.md).
+    strategy.assert_live_entry_mode_enabled(config.ENTRY_MODE)
 
-    # 2. Risk manager (loads any persisted disabled flag) + journal counters
-    risk = RiskManager(starting_balance)
+    # 1. Connect to broker and obtain the live balance
+    broker_balance = data_feed.connect_broker()
+    logger.info(f"Connected to {config.BROKER} — broker balance: {broker_balance}")
+
+    # 2. Risk manager: restore persisted STEP-START baseline (or re-baseline
+    #    on --new-step). Never derive the max-loss anchor from live balance.
+    risk = RiskManager.load_or_init(broker_balance, reset=new_step)
+    starting_balance = risk.starting_balance
     risk.sync_counters_from_journal()
 
     # 3. Optional MetaVeto (may only BLOCK candidates; off by default)
@@ -148,9 +165,47 @@ def manage_positions(state: BotState, dry_run: bool = False) -> None:
         execution.manage_breakeven(SYMBOL)
 
 
+# ── Broker-close reconciliation (Finding 2) ───────────────────
+
+def reconcile_broker_closes(state: BotState) -> None:
+    """
+    Detect journalled-open tickets that the broker has closed (SL/TP) since the
+    last loop, write their exits into the journal, and update the RiskManager's
+    consecutive-loss counters. Refreshes the last-seen P&L snapshot so the NEXT
+    loop can classify a close that happens this candle.
+    """
+    try:
+        broker_positions = execution.get_open_positions(SYMBOL)
+    except Exception as exc:
+        logger.warning(f"reconcile: could not read broker positions ({exc}) — skipping.")
+        return
+
+    broker_open_tickets = {int(p["ticket"]) for p in broker_positions}
+    prev_profit = state.last_profit_by_ticket
+
+    try:
+        journal_open = trade_journal.get_open_positions()
+    except Exception as exc:
+        logger.warning(f"reconcile: could not read journal ({exc}) — skipping.")
+        return
+
+    reconcile.reconcile_closures(
+        journal_open=journal_open,
+        broker_open_tickets=broker_open_tickets,
+        last_profit_by_ticket=prev_profit,
+        on_exit=trade_journal.log_exit,
+        on_result=state.risk.record_trade_result,
+    )
+
+    # Refresh the snapshot to CURRENT floating P&L for still-open tickets.
+    state.last_profit_by_ticket = {
+        int(p["ticket"]): float(p.get("profit", 0.0)) for p in broker_positions
+    }
+
+
 # ── Candle processor ──────────────────────────────────────────
 
-def process_candle(state: BotState, dry_run: bool = False) -> None:
+def process_candle(state: BotState, dry_run: bool = False) -> bool:
     """
     Runs once per new M15 candle.  Steps:
       1. Equity check + open-position management (BE move, news flatten)
@@ -162,6 +217,11 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
       7. Optional MetaVeto (block-only)
       8. SL/TP via clamp (skip when violated) + lot sizing
       9. Order execution (or dry-run log) + journal + counters
+
+    Returns True when the candle was fully handled (including legitimate
+    no-trade decisions), False on a TRANSIENT infra failure (broker/data read)
+    so the caller retries the same candle next poll instead of skipping it
+    (Finding 7).
     """
 
     # Step 1: current equity (includes floating P&L) and position upkeep
@@ -169,13 +229,17 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
         acct = data_feed.get_account_info()
         if not acct:
             logger.error("process_candle: broker account info returned empty.")
-            return
+            return False
         equity = float(acct["equity"])
     except Exception as exc:
         logger.exception(f"process_candle: failed to read equity: {exc}")
-        return
+        return False
 
     manage_positions(state, dry_run=dry_run)
+
+    # Step 1b: reconcile any broker-side SL/TP closes BEFORE syncing counters,
+    # so consecutive-loss stops see the real results (Finding 2).
+    reconcile_broker_closes(state)
 
     # Step 2: risk gate (kill switch, weekly/daily stops, pacing, rollover)
     try:
@@ -187,27 +251,27 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
     can_trade, reason = state.risk.can_trade(equity, open_trades)
     if not can_trade:
         logger.warning(f"process_candle: blocked — {reason}")
-        return
+        return True  # legitimately blocked — candle handled, don't retry
 
     # regime_daily mode takes exactly ONE entry per day (the first valid one)
     if config.ENTRY_MODE == "regime_daily" and state.risk.trades_today >= 1:
         logger.info("process_candle: regime_daily entry already taken today.")
-        return
+        return True
 
     # Step 3: session window (entries 08:00–17:00 London, Friday cutoff, …)
     now = datetime.now(UTC)
     if not strategy.entry_session_ok(now):
         logger.info("process_candle: outside entry session — skipping.")
-        return
+        return True
 
     # Step 4: news entry blackout (±30 min high impact, ±60 min majors)
     try:
         if news_filter.is_news_window(SYMBOL):
             logger.info("process_candle: inside news window — skipping.")
-            return
+            return True
     except Exception:
         logger.warning("process_candle: news filter failed — skipping candle (fail-closed).")
-        return
+        return True  # fail-closed skip is a decision, not a retryable fault
 
     # Step 5: rules candidate (the strategy IS the rules)
     try:
@@ -217,10 +281,10 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
         candidate = strategy.generate_candidate(df_m15, df_h1, params)
     except Exception as exc:
         logger.exception(f"process_candle: candidate generation failed: {exc}")
-        return
+        return False  # transient data failure — retry this candle
     if candidate is None:
         logger.info("process_candle: no rules setup — no trade.")
-        return
+        return True
 
     # Step 6: spread + volatility filters
     spec = get_symbol_spec(SYMBOL)
@@ -229,10 +293,10 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
         spread_pips = (float(tick["ask"]) - float(tick["bid"])) / spec.pip_size
     except Exception as exc:
         logger.exception(f"process_candle: tick fetch failed: {exc}")
-        return
+        return False  # transient quote failure — retry this candle
     if not strategy.spread_ok(spread_pips):
         logger.info(f"process_candle: spread {spread_pips:.1f} pips too wide — skipping.")
-        return
+        return True
 
     atr_pips = candidate.atr / spec.pip_size
     atr_median_pips = (
@@ -240,7 +304,7 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
     )
     if not strategy.volatility_ok(atr_pips, atr_median_pips):
         logger.info(f"process_candle: ATR {atr_pips:.1f} pips outside band — skipping.")
-        return
+        return True
 
     # Step 7: optional MetaVeto — it may only BLOCK, never create
     if state.meta_veto is not None:
@@ -263,12 +327,12 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
     )
     if sl_tp is None:
         logger.info("process_candle: SL outside [8, 25] pip clamp — skipping trade.")
-        return
+        return True
     sl, tp = sl_tp
     lot = state.risk.calculate_lot_size(equity, sl, entry, SYMBOL)
     if lot <= 0:
         logger.info("process_candle: lot size 0 — skipping trade.")
-        return
+        return True
 
     # Step 9: Execute or dry-run
     action = "BUY" if candidate.direction == 1 else "SELL"
@@ -277,7 +341,7 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
             f"[DRY RUN] {action} candidate ({candidate.reason}) "
             f"entry={entry} sl={sl} tp={tp} lot={lot}"
         )
-        return
+        return True
 
     result = execution.place_order(SYMBOL, candidate.direction, lot, sl, tp)
     if result:
@@ -291,12 +355,17 @@ def process_candle(state: BotState, dry_run: bool = False) -> None:
             tp=tp,
         )
         state.risk.record_trade_opened()
+        # Seed the P&L snapshot so a close on the very next loop reconciles.
+        state.last_profit_by_ticket[int(result["ticket"])] = 0.0
         logger.info(
             f"TRADE OPENED — ticket={result['ticket']} "
             f"{action} {lot} lots @ {result['price']}  SL={sl}  TP={tp}"
         )
     else:
+        # Order rejected. Do NOT retry the candle (avoid duplicate orders if it
+        # actually reached the broker); operator/logs handle the failure.
         logger.error("process_candle: place_order returned None — order failed.")
+    return True
 
 
 # ── Main entry ────────────────────────────────────────────────
@@ -308,9 +377,16 @@ def main() -> None:
         action="store_true",
         help="Run in dry-run mode (log signals but do not place real orders).",
     )
+    parser.add_argument(
+        "--new-step",
+        action="store_true",
+        help="Re-baseline the risk state to the current broker balance. Use "
+             "ONLY when deliberately starting a fresh challenge step / account "
+             "(overwrites the persisted step-start baseline).",
+    )
     args = parser.parse_args()
 
-    state = initialize_bot(dry_run=args.dry_run)
+    state = initialize_bot(dry_run=args.dry_run, new_step=args.new_step)
     last_candle: datetime | None = None
 
     logger.info("Entering main loop — polling every 5 s ...")
@@ -320,8 +396,14 @@ def main() -> None:
             candle_time = get_current_m15_time()
             if candle_time != last_candle:
                 logger.info(f"New M15 candle: {candle_time.isoformat()}")
-                last_candle = candle_time
-                process_candle(state, dry_run=args.dry_run)
+                # Only advance last_candle when the candle was fully handled,
+                # so a transient broker/data failure retries next poll instead
+                # of silently skipping the candle (Finding 7).
+                if process_candle(state, dry_run=args.dry_run):
+                    last_candle = candle_time
+                else:
+                    logger.warning("process_candle reported a transient failure "
+                                   "— will retry this candle next poll.")
 
             time.sleep(5)
 
@@ -331,6 +413,8 @@ def main() -> None:
             break
 
         except Exception as exc:
+            # Do NOT advance last_candle — the same candle is retried on the
+            # next poll once the transient fault clears.
             logger.exception(f"Unhandled error in main loop: {exc}")
             time.sleep(5)
 
