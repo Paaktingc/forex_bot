@@ -464,6 +464,40 @@ def log_exit(ticket: int, exit_price: float, exit_reason: str) -> None:
         logger.error(f"Failed to log exit for trade {ticket}: {exc}")
 
 
+def get_open_positions() -> list[dict]:
+    """
+    Returns journalled trades that have NO recorded exit yet (exit_price is
+    NA), as dicts: ticket, symbol, direction, entry_price, sl, tp, lot_size.
+    Used by the live loop to detect broker-side closes (SL/TP) that must be
+    reconciled back into the journal (Finding 2).
+    """
+    try:
+        df = _read_journal()
+        if df.empty:
+            return []
+        open_mask = df["exit_price"].isna()
+        out = []
+        for _, row in df.loc[open_mask].iterrows():
+            ticket = _coerce_int(row.get("ticket"))
+            if ticket is None:
+                continue
+            out.append(
+                {
+                    "ticket": ticket,
+                    "symbol": str(row.get("symbol") or config.SYMBOL),
+                    "direction": str(row.get("direction") or "").upper(),
+                    "entry_price": _coerce_float(row.get("entry_price")),
+                    "sl": _coerce_float(row.get("sl")),
+                    "tp": _coerce_float(row.get("tp")),
+                    "lot_size": _coerce_float(row.get("lot_size")),
+                }
+            )
+        return out
+    except Exception as exc:
+        logger.error(f"get_open_positions failed: {exc}")
+        return []
+
+
 def get_closed_trades() -> list[tuple[datetime, str]]:
     """
     Returns (exit_time, result) tuples for closed trades in exit-time order.
