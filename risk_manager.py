@@ -152,6 +152,11 @@ class RiskManager:
         self.halted_today: bool = False
         self.halted_this_week: bool = False
 
+        # High Stakes "minimum profitable days" gate (no-op for Bootcamp, where
+        # config.MIN_PROFITABLE_DAYS == 0). A profitable day = the day closes
+        # with realized gain >= PROFITABLE_DAY_MIN_PCT of the step balance.
+        self.profitable_days: int = 0
+
         # Pacing counters (fed from trade_journal via sync_counters_from_journal
         # in live mode, or record_trade_* in backtests)
         self.trades_today: int = 0
@@ -169,6 +174,146 @@ class RiskManager:
                 "trading stays halted until the flag file is removed manually.",
                 self.disabled_flag_path,
             )
+
+    # ------------------------------------------------------------------
+    # Persistent risk state (Finding 1: baseline must survive restart)
+    # ------------------------------------------------------------------
+    #
+    # The STEP-START balance is the anchor for the kill switch and the official
+    # max-loss backstop. It must NEVER be re-derived from the live broker
+    # balance on restart, or a restart after losses silently moves the −3%/−6%
+    # kill baseline downward. We persist it (plus daily/weekly baselines and
+    # counters) to RISK_STATE_PATH and restore it verbatim on startup. Starting
+    # a genuinely new step (fresh account balance) is a DELIBERATE operator
+    # action via RiskManager.load_or_init(reset=True) — never inferred.
+
+    STATE_VERSION = 1
+
+    @property
+    def state_path(self) -> Path:
+        return Path(config.RISK_STATE_PATH)
+
+    def to_state(self) -> dict:
+        """Serializable snapshot of everything needed to resume safely."""
+        return {
+            "version": self.STATE_VERSION,
+            "programme": getattr(config, "PROGRAMME", "bootcamp"),
+            "starting_balance": self.starting_balance,
+            "created_at": self.created_at.astimezone(UTC).isoformat(),
+            "daily_start_balance": self.daily_start_balance,
+            "daily_start_time": self.daily_start_time.astimezone(UTC).isoformat(),
+            "week_start_balance": self.week_start_balance,
+            "week_start_time": self.week_start_time.astimezone(UTC).isoformat(),
+            "halted_today": self.halted_today,
+            "halted_this_week": self.halted_this_week,
+            "trades_today": self.trades_today,
+            "consec_losses_day": self.consec_losses_day,
+            "consec_losses_week": self.consec_losses_week,
+            "profitable_days": self.profitable_days,
+            "last_trade_time": (
+                self.last_trade_time.astimezone(UTC).isoformat()
+                if self.last_trade_time else None
+            ),
+        }
+
+    def save_state(self) -> None:
+        """Atomically persist the risk state. Best-effort: never raises."""
+        try:
+            path = self.state_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self.to_state(), indent=2))
+            tmp.replace(path)
+        except Exception as exc:  # persistence must not crash the trader
+            logger.warning("save_state failed (%s) — continuing.", exc)
+
+    def _apply_state(self, st: dict) -> None:
+        """Restore baselines/counters from a persisted state dict."""
+        self.starting_balance = float(st["starting_balance"])
+        self.created_at = datetime.fromisoformat(st["created_at"])
+        self.daily_start_balance = float(st["daily_start_balance"])
+        self.daily_start_time = datetime.fromisoformat(st["daily_start_time"])
+        self.week_start_balance = float(st["week_start_balance"])
+        self.week_start_time = datetime.fromisoformat(st["week_start_time"])
+        self.halted_today = bool(st.get("halted_today", False))
+        self.halted_this_week = bool(st.get("halted_this_week", False))
+        self.trades_today = int(st.get("trades_today", 0))
+        self.consec_losses_day = int(st.get("consec_losses_day", 0))
+        self.consec_losses_week = int(st.get("consec_losses_week", 0))
+        self.profitable_days = int(st.get("profitable_days", 0))
+        lt = st.get("last_trade_time")
+        self.last_trade_time = datetime.fromisoformat(lt) if lt else None
+
+    @classmethod
+    def load_or_init(
+        cls,
+        broker_balance: float,
+        reset: bool = False,
+        disabled_flag_path: str | Path | None = None,
+    ) -> "RiskManager":
+        """
+        Startup factory. Restores the persisted STEP-START baseline if a valid
+        state file exists for the active programme; otherwise creates a fresh
+        baseline from the live broker balance and persists it.
+
+        reset=True forces a fresh baseline from broker_balance (use ONLY when
+        deliberately starting a new challenge step / new account).
+        """
+        rm = cls(broker_balance, disabled_flag_path=disabled_flag_path)
+        path = Path(config.RISK_STATE_PATH)
+
+        if reset:
+            logger.warning(
+                "RiskManager.load_or_init(reset=True): re-baselining to broker "
+                "balance %.2f and overwriting %s.", broker_balance, path,
+            )
+            rm.save_state()
+            return rm
+
+        if not path.exists():
+            logger.info(
+                "No persisted risk state at %s — initializing fresh baseline "
+                "from broker balance %.2f.", path, broker_balance,
+            )
+            rm.save_state()
+            return rm
+
+        try:
+            st = json.loads(path.read_text())
+        except Exception as exc:
+            logger.error(
+                "Risk state at %s is unreadable (%s) — refusing to guess. "
+                "Initializing fresh baseline from broker balance and overwriting.",
+                path, exc,
+            )
+            rm.save_state()
+            return rm
+
+        active = getattr(config, "PROGRAMME", "bootcamp")
+        if st.get("programme") != active:
+            logger.warning(
+                "Persisted risk state is for programme %r but active programme "
+                "is %r — NOT reusing its baseline. Starting fresh (use "
+                "--new-step if this is intentional).", st.get("programme"), active,
+            )
+            rm.save_state()
+            return rm
+
+        rm._apply_state(st)
+        drift = broker_balance - rm.starting_balance
+        logger.critical(
+            "RiskManager RESTORED persisted baseline: step-start=%.2f "
+            "(broker now=%.2f, drift=%+.2f). Kill/max-loss anchored to the "
+            "persisted step-start, NOT the current balance.",
+            rm.starting_balance, broker_balance, drift,
+        )
+        if broker_balance > rm.starting_balance * (1.0 + config.PROFIT_TARGET_PCT + 0.01):
+            logger.critical(
+                "Broker balance is well ABOVE the persisted step-start — this "
+                "looks like a NEW step. If so, relaunch with --new-step to "
+                "re-baseline. Continuing with the OLD baseline for safety.",
+            )
+        return rm
 
     # ------------------------------------------------------------------
     # Kill switch persistence
@@ -201,8 +346,9 @@ class RiskManager:
     def check_kill_switch(self, current_equity: float) -> bool:
         """
         Operative hard stop. Returns False (and flattens + disables) once
-        equity INCLUDING floating P&L is down KILL_SWITCH_PCT (−3%) from the
-        initial step balance. The official −5% limit must never be reached.
+        equity INCLUDING floating P&L is down KILL_SWITCH_PCT from the initial
+        step balance (−3% Bootcamp / −6% High Stakes, per the active profile).
+        The official MAX_DRAWDOWN_LIMIT (−5% / −10%) must never be reached.
         """
         if self.is_disabled():
             return False
@@ -226,6 +372,22 @@ class RiskManager:
         """
         now = server_now()
         if now.date() > self.daily_start_time.astimezone(_server_tz()).date():
+            # Credit a profitable day BEFORE resetting the day-start baseline.
+            # The5ers defines it as: min(midnight balance, midnight equity) −
+            # previous-day balance >= PROFITABLE_DAY_MIN_PCT of the balance.
+            # We approximate with equity at the day boundary (the London bot is
+            # flat overnight, so equity ≈ balance here).
+            if config.MIN_PROFITABLE_DAYS and self.starting_balance > 0:
+                day_profit = current_equity - self.daily_start_balance
+                threshold = config.PROFITABLE_DAY_MIN_PCT * self.starting_balance
+                if day_profit >= threshold:
+                    self.profitable_days += 1
+                    logger.info(
+                        "Profitable day credited (%.2f%% of balance). "
+                        "Profitable days: %d/%d.",
+                        day_profit / self.starting_balance * 100.0,
+                        self.profitable_days, config.MIN_PROFITABLE_DAYS,
+                    )
             logger.info(
                 f"New server day detected. Resetting daily balance from "
                 f"{self.daily_start_balance} to current equity {current_equity}."
@@ -235,7 +397,41 @@ class RiskManager:
             self.halted_today = False
             self.trades_today = 0
             self.consec_losses_day = 0
+            self.save_state()  # new day baseline must survive a restart
         self._maybe_reset_weekly(current_equity, now)
+
+    def profitable_days_met(self) -> bool:
+        """
+        True when the programme's minimum-profitable-days requirement is
+        satisfied (always True for programmes that don't require any, e.g.
+        Bootcamp). High Stakes requires >= config.MIN_PROFITABLE_DAYS before a
+        step's profit target counts as a pass.
+        """
+        return self.profitable_days >= config.MIN_PROFITABLE_DAYS
+
+    def check_official_daily_loss(self, current_equity: float) -> bool:
+        """
+        Official daily-loss backstop (High Stakes: 5% of day-start balance).
+        Returns False and disables trading if breached. No-op for programmes
+        without an official daily limit (Bootcamp steps → OFFICIAL_DAILY_LOSS_PCT
+        is None). The self-imposed check_daily_loss() pacing stop (−1.5%) fires
+        long before this; this is belt-and-braces against a fast gap day.
+        """
+        limit = config.OFFICIAL_DAILY_LOSS_PCT
+        if not limit or self.daily_start_balance <= 0:
+            return True
+        loss_pct = max(
+            (self.daily_start_balance - current_equity) / self.daily_start_balance,
+            0.0,
+        )
+        if loss_pct >= limit:
+            self.disable_trading(
+                f"OFFICIAL DAILY LOSS: {loss_pct:.2%} >= {limit:.2%} of "
+                f"day-start balance",
+                current_equity=current_equity,
+            )
+            return False
+        return True
 
     def _maybe_reset_weekly(self, current_equity: float, now: datetime | None = None) -> None:
         """Resets weekly counters on Monday (server time, ISO week change)."""
@@ -259,6 +455,7 @@ class RiskManager:
     def record_trade_opened(self, when: datetime | None = None) -> None:
         self.trades_today += 1
         self.last_trade_time = when or datetime.now(UTC)
+        self.save_state()
 
     def record_trade_result(self, result: str) -> None:
         """Updates consecutive-loss counters from a closed trade result."""
@@ -270,6 +467,38 @@ class RiskManager:
             self.consec_losses_day = 0
             self.consec_losses_week = 0
         # BE leaves the streak untouched
+        self.save_state()
+
+    # ------------------------------------------------------------------
+    # Evaluation-target stop (Finding 4)
+    # ------------------------------------------------------------------
+
+    def profit_target_reached(self, current_equity: float) -> bool:
+        """
+        True once equity (incl. floating P&L) has reached the active step's
+        profit target AND the programme's minimum-profitable-days requirement
+        is met (always satisfied for Bootcamp, which requires none).
+        """
+        if self.starting_balance <= 0:
+            return False
+        gain_pct = (current_equity - self.starting_balance) / self.starting_balance
+        return gain_pct >= config.PROFIT_TARGET_PCT and self.profitable_days_met()
+
+    def halt_for_target(self, current_equity: float) -> None:
+        """
+        Locks in a passing step: flattens open positions and persists a
+        BENIGN halt flag so a restart cannot resume trading and give the pass
+        back. Distinct from the kill switch — the reason string makes clear
+        this is a SUCCESS. Operator re-arms for the next step by relaunching
+        with --new-step (which re-baselines and clears the flag).
+        """
+        self.disable_trading(
+            f"STEP TARGET REACHED (+{config.PROFIT_TARGET_PCT:.0%}) — step "
+            f"passed. Do NOT keep trading. Start the next step with "
+            f"--new-step. Equity {current_equity:.2f} vs step-start "
+            f"{self.starting_balance:.2f}.",
+            current_equity=current_equity,
+        )
 
     def sync_counters_from_journal(self) -> None:
         """
@@ -583,26 +812,41 @@ class RiskManager:
     ) -> tuple[bool, str]:
         """
         Master gate. Checks in priority order:
-          a. Persisted disabled flag (kill switch, survives restart)
-          b. Kill switch (−3% incl. floating → flatten + disable)
-          c. Official −5% backstop
-          d. Weekly stop (−1.5% or 5 consecutive losses)
-          e. Daily loss (−0.75%, server-midnight auto-reset)
-          f. Daily pacing (2 trades or 2 consecutive losses)
-          g. Rollover / server no-trade window
-          h. Max open trades
+          a. Persisted disabled flag (kill switch / passed step, survives restart)
+          b. Kill switch (−3%/−6% incl. floating → flatten + disable)
+          c. Official max-loss backstop (−5%/−10%)
+          d. Profit target reached → halt (lock in the pass; Finding 4)
+          e. Official daily loss (High Stakes 5%; None for Bootcamp steps)
+          f. Weekly stop (−1.5%/−3% or consecutive losses)
+          g. Daily loss (self-imposed pacing, server-midnight auto-reset)
+          h. Daily pacing (trade count / consecutive losses)
+          i. Rollover / server no-trade window
+          j. Max open trades
         Returns (True, "OK") only when all checks pass.
         """
         self._maybe_reset_daily(current_equity)
 
         if self.is_disabled():
-            return False, "TRADING DISABLED (kill switch flag present)"
+            return False, "TRADING DISABLED (kill switch / passed-step flag present)"
 
         if not self.check_kill_switch(current_equity):
             return False, "KILL SWITCH HIT"
 
         if not self.check_absolute_drawdown(current_equity):
             return False, "MAX DRAWDOWN HIT"
+
+        # Evaluation-target stop: once the step is passed, STOP. Trading on
+        # would risk giving back a qualifying result (Finding 4).
+        if self.profit_target_reached(current_equity):
+            self.halt_for_target(current_equity)
+            return False, "STEP TARGET REACHED — step passed, trading halted"
+
+        # Programme-specific official backstop.  Bootcamp configures this as
+        # None; High Stakes configures the firm's 5% daily loss limit.  Keep
+        # this separate from the tighter self-imposed pacing stop below so a
+        # future pacing change cannot silently remove the official rule.
+        if not self.check_official_daily_loss(current_equity):
+            return False, "OFFICIAL DAILY LOSS LIMIT HIT"
 
         if not self.check_weekly_loss(current_equity):
             return False, "WEEKLY STOP HIT"

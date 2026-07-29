@@ -31,31 +31,103 @@ BOT_LABEL = "RULES_BOT_V2"
 CTRADER_ENV = os.getenv("CTRADER_ENV", "demo").lower()
 CTRADER_UNITS_PER_LOT = 100_000
 
-# ---------------------------------------------------------------------------
-# The5ers BOOTCAMP rules ($20K plan: steps $5k → $10k → $15k)
-#   Official per step: target +6%; max loss −5% STATIC from the initial step
-#   balance; no official daily pause during challenge steps; 1:30 leverage;
-#   unlimited time; 30-day inactivity closure; every order needs a visible SL;
-#   no bulk trading.
+# ===========================================================================
+# PROGRAMME PROFILES — The5ers evaluation targets (verified 2026-07-21)
+# ===========================================================================
+# The frozen London strategy is programme-agnostic. All barrier geometry,
+# circuit breakers, pacing stops and risk sizing live in one profile so the
+# SAME edge can target a different evaluation without touching strategy.py.
 #
-# The official −5% limit is NEVER the bot's working limit: the bot flattens
-# and disables itself at −3% (KILL_SWITCH_PCT) so a slippage/gap on the last
-# trade cannot reach the official breach level.
+# Select with the PROGRAMME env var (default "bootcamp"): "bootcamp" | "high_stakes".
+#
+# Rule sources (first-party, dated):
+#   Bootcamp    the5ers.com/bootcamp + help.the5ers.com (upd. 01.07.2026)
+#   High Stakes the5ers.com/high-stakes + help center max-loss article
+#
+# Cycle-6 finding: the frozen edge models NO-GO on Bootcamp (P(pass)~66%,
+# P(kill)~34%) but ~73–93% two-step completion on High Stakes, because a
+# symmetric 10%/10% barrier with unlimited time suits a thin positive edge
+# far better than an asymmetric +6/−3 gauntlet. See cycle6_research_report.md.
 # ---------------------------------------------------------------------------
+PROGRAMMES = {
+    # 3-step Bootcamp: +6% target, −5% STATIC max loss per step; kill at −3%
+    # so a gap/slippage on the last trade cannot reach the official breach.
+    "bootcamp": {
+        "label": "The5ers Bootcamp (3-step)",
+        "steps": (0.06, 0.06, 0.06),   # per-step profit targets
+        "max_drawdown_limit": 0.05,    # official static max loss per step
+        "kill_switch_pct": 0.03,       # operative flatten+disable (< official)
+        "drawdown_warning": 0.02,      # soft: halve position size
+        "official_daily_loss": None,   # no official daily pause during steps
+        "daily_loss_pct": 0.0075,      # self-imposed pacing stop
+        "weekly_stop_pct": 0.015,
+        "max_consec_losses_day": 2,
+        "max_consec_losses_week": 5,
+        "max_trades_per_day": 2,
+        # 0.20%: the drawdown gate binds, not the kill. On the frozen EURUSD
+        # ablation-(a) R distribution, P(maxDD>5%) over a 1y horizon is 2.0% at
+        # 0.20% but 15.3% at the old 0.30% — three times over the repo's own
+        # P(maxDD>5%)<5% hard gate (STEP 1 / GATE A, 2026-07-27). Feasible
+        # window is risk ≤ 0.23%; 0.20% is chosen with margin. Enforced by
+        # tests/test_programme_risk_gate.py.
+        "risk_per_trade_pct": 0.002,
+        "min_profitable_days": 0,      # none required
+        "profitable_day_min_pct": 0.0,
+    },
+    # 2-step High Stakes: 10% then 5% target, −10% STATIC max loss, 5% daily
+    # loss, ≥3 profitable days (a day with closed profit ≥0.5% of balance).
+    # Circuit breakers retuned to the 10% budget: kill −6%, hard warn −8%.
+    "high_stakes": {
+        "label": "The5ers High Stakes (2-step)",
+        "steps": (0.10, 0.05),         # step 1 = 10%, step 2 = 5%
+        "max_drawdown_limit": 0.10,    # official static max loss
+        "kill_switch_pct": 0.06,       # operative flatten+disable (< official)
+        "drawdown_warning": 0.04,      # soft: halve position size
+        "official_daily_loss": 0.05,   # official 5% daily loss limit
+        "daily_loss_pct": 0.015,       # self-imposed pacing (well inside 5%)
+        "weekly_stop_pct": 0.030,
+        "max_consec_losses_day": 3,
+        "max_consec_losses_week": 6,
+        "max_trades_per_day": 2,
+        # 0.20%: P(maxDD>5%) is a property of the return stream, not the
+        # programme budget — at the old 0.40% it was 35.2%, far past the
+        # P(maxDD>5%)<5% hard gate. The wider −10% High Stakes budget does not
+        # license a higher per-trade risk on this thin edge; it buys completion
+        # probability with time (STEP 1e). 0.20% → P(maxDD>5%)=2.0%.
+        "risk_per_trade_pct": 0.002,
+        "min_profitable_days": 3,      # ≥3 profitable days per step
+        "profitable_day_min_pct": 0.005,  # a "profitable day" = closed +0.5%
+    },
+}
+
+PROGRAMME = os.getenv("PROGRAMME", "bootcamp").lower()
+if PROGRAMME not in PROGRAMMES:
+    raise ValueError(
+        f"Unknown PROGRAMME={PROGRAMME!r}; choose one of {list(PROGRAMMES)}"
+    )
+_P = PROGRAMMES[PROGRAMME]
+
+# --- Derived programme constants (consumed by risk_manager / backtest / MC) ---
 STARTING_BALANCE = None
-MAX_DRAWDOWN_LIMIT = 0.05             # Official Bootcamp max loss (static, informational)
-KILL_SWITCH_PCT = 0.03                # Operative hard stop: flatten + disable (persisted)
-DRAWDOWN_WARNING_THRESHOLD = 0.02     # Soft threshold → reduce position size 50%
-MAX_DRAWDOWN_PCT = MAX_DRAWDOWN_LIMIT  # Backward-compat alias (legacy refs + tests)
+PROGRAMME_STEPS = _P["steps"]                       # tuple of per-step targets
+PROFIT_TARGET_PCT = _P["steps"][0]                  # first-step target (legacy alias)
+MAX_DRAWDOWN_LIMIT = _P["max_drawdown_limit"]       # official static max loss
+KILL_SWITCH_PCT = _P["kill_switch_pct"]             # operative hard stop
+DRAWDOWN_WARNING_THRESHOLD = _P["drawdown_warning"] # soft size-reduction
+MAX_DRAWDOWN_PCT = MAX_DRAWDOWN_LIMIT               # backward-compat alias
+OFFICIAL_DAILY_LOSS_PCT = _P["official_daily_loss"] # None for Bootcamp steps
 
-# Self-imposed pacing stops (Bootcamp has no official daily pause during steps)
-DAILY_LOSS_PCT = 0.0075               # Stop for the day at −0.75% from day-start balance
-WEEKLY_STOP_PCT = 0.015               # Stop for the week at −1.5% from week-start balance
-MAX_CONSEC_LOSSES_DAY = 2             # Stop for the day after 2 consecutive losses
-MAX_CONSEC_LOSSES_WEEK = 5            # Stop for the week after 5 consecutive losses
-MAX_TRADES_PER_DAY = 2                # Hard cap on entries per server day
+DAILY_LOSS_PCT = _P["daily_loss_pct"]               # self-imposed daily pacing
+WEEKLY_STOP_PCT = _P["weekly_stop_pct"]
+MAX_CONSEC_LOSSES_DAY = _P["max_consec_losses_day"]
+MAX_CONSEC_LOSSES_WEEK = _P["max_consec_losses_week"]
+MAX_TRADES_PER_DAY = _P["max_trades_per_day"]
 
-RISK_PER_TRADE_PCT = 0.003            # 0.3% per trade; safety over speed
+RISK_PER_TRADE_PCT = _P["risk_per_trade_pct"]
+
+# High Stakes profitable-day gate (0 / 0.0 disables it for Bootcamp)
+MIN_PROFITABLE_DAYS = _P["min_profitable_days"]
+PROFITABLE_DAY_MIN_PCT = _P["profitable_day_min_pct"]
 
 # Stop Loss / Take Profit
 SL_ATR_MULT = 1.5                     # SL = 1.5×ATR beyond the pullback swing
@@ -82,7 +154,7 @@ ADX_MIN = 20.0                        # H1 ADX(14) regime gate
 ADX_MIN_RELAXED = 15.0                # Heartbeat mode relaxes the gate one notch
 
 # Step target / inactivity heartbeat
-PROFIT_TARGET_PCT = 0.06              # Bootcamp step target (+6%)
+# (PROFIT_TARGET_PCT is now derived from the active PROGRAMME profile above.)
 HEARTBEAT_DAYS = 21                   # If no trade in 21 days, permit one reduced-risk
 HEARTBEAT_RISK_PCT = 0.001            # ... setup at 0.1% risk (avoids 30-day closure)
 
@@ -95,6 +167,14 @@ MIN_CONFIDENCE = 0.65                 # Legacy ML-entry threshold (entries retir
 # Execution Limits
 MAX_OPEN_TRADES = 1                   # The5ers prohibits bulk trading
 MIN_TRADE_DURATION = 60
+# Timezone in which the Forex Factory calendar is RENDERED for the scraper.
+# FF localizes event times to the account/cookie timezone; parsing them as UTC
+# blindly can shift every blackout by hours (Finding 3). Set this to the IANA
+# zone your FF session renders in (verify once against a known event time), or
+# set your FF account to GMT and leave "UTC". Times are localized to this zone
+# then converted to UTC.
+NEWS_SOURCE_TZ = os.getenv("NEWS_SOURCE_TZ", "UTC")
+
 NEWS_BUFFER_MINS = 30                 # High-impact EUR/USD events: no entries ±30 min
 NEWS_MAJOR_BUFFER_MINS = 60           # NFP/US CPI/FOMC/ECB: no entries ±60 min
 NEWS_FLATTEN_BEFORE_MINS = 15         # ... and flatten open positions 15 min before

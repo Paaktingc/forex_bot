@@ -205,6 +205,9 @@ def run_step_monte_carlo(
     n_paths: int = DEFAULT_N_PATHS,
     block_size: int = DEFAULT_BLOCK_SIZE,
     seed: int = RANDOM_SEED,
+    target: float = STEP_TARGET,
+    fail: float = STEP_FAIL,
+    kill: float = KILL_SWITCH,
 ) -> dict:
     """
     Block-bootstraps ``n_paths`` (≥20k) trade sequences and pushes each
@@ -214,7 +217,9 @@ def run_step_monte_carlo(
     paths = block_bootstrap_paths(
         pct_returns, n_paths=n_paths, block_size=block_size, seed=seed
     )
-    outcomes, trades = _step_outcomes_vectorized(paths)
+    outcomes, trades = _step_outcomes_vectorized(
+        paths, target=target, fail=fail, kill=kill
+    )
 
     n = float(len(outcomes))
     p_pass = float((outcomes == 0).sum()) / n
@@ -228,6 +233,9 @@ def run_step_monte_carlo(
         {
             "n_paths": int(n_paths),
             "block_size": int(block_size),
+            "target_pct": round(target * 100.0, 2),
+            "fail_pct": round(fail * 100.0, 2),
+            "kill_pct": round(kill * 100.0, 2),
             "p_pass": round(p_pass, 4),
             "p_kill_switch": round(p_kill + p_breach, 4),  # kill fires by −3% incl. gaps
             "p_breach_official": round(p_breach, 4),
@@ -238,8 +246,127 @@ def run_step_monte_carlo(
     return stats
 
 
-def print_step_report(result: dict) -> None:
-    print(f"\nMONTE CARLO — Bootcamp step simulator "
+# ---------------------------------------------------------------------------
+# Multi-step programme Monte Carlo (Bootcamp = 3 steps, High Stakes = 2 steps)
+# ---------------------------------------------------------------------------
+
+def run_programme_monte_carlo(
+    pct_returns: np.ndarray,
+    step_targets: tuple[float, ...],
+    fail: float,
+    kill: float,
+    r_multiples: np.ndarray | None = None,
+    n_paths: int = DEFAULT_N_PATHS,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    seed: int = RANDOM_SEED,
+) -> dict:
+    """
+    Chains an evaluation programme of ``len(step_targets)`` steps.
+
+    Each step is an independent barrier game on a FRESH block-bootstrap path
+    (target[i] up, ``fail`` down official, ``kill`` down operative). A trader
+    who KILLs or BREACHes a step ends the programme; passing the final step
+    completes it. Per-step geometry lets one function serve both Bootcamp
+    (+6/+6/+6, −5, −3) and High Stakes (+10/+5, −10, −6).
+
+    Returns per-step P(pass)/P(kill)/P(breach), the full-programme completion
+    probability, and expected trades to complete (sum of per-step medians).
+    Independent-step assumption is optimistic; treat differences between
+    programmes as the signal, not the absolute completion number.
+    """
+    per_step = []
+    completion = 1.0
+    expected_trades = 0.0
+    for i, target in enumerate(step_targets):
+        paths = block_bootstrap_paths(
+            pct_returns, n_paths=n_paths, block_size=block_size, seed=seed + i
+        )
+        outcomes, trades = _step_outcomes_vectorized(
+            paths, target=target, fail=fail, kill=kill
+        )
+        n = float(len(outcomes))
+        p_pass = float((outcomes == 0).sum()) / n
+        p_kill = float((outcomes == 1).sum()) / n
+        p_breach = float((outcomes == 2).sum()) / n
+        pass_trades = trades[outcomes == 0]
+        med = float(np.median(pass_trades)) if pass_trades.size else float("nan")
+        per_step.append(
+            {
+                "step": i + 1,
+                "target_pct": round(target * 100, 2),
+                "p_pass": round(p_pass, 4),
+                "p_kill_switch": round(p_kill + p_breach, 4),
+                "p_breach_official": round(p_breach, 4),
+                "median_trades_to_pass": med,
+            }
+        )
+        completion *= p_pass
+        if med == med:  # not NaN
+            expected_trades += med / max(p_pass, 1e-9)  # expected incl. retries-free
+
+    stats = trade_stats(pct_returns, r_multiples)
+    stats.update(
+        {
+            "n_paths": int(n_paths),
+            "block_size": int(block_size),
+            "n_steps": len(step_targets),
+            "step_targets_pct": [round(t * 100, 2) for t in step_targets],
+            "fail_pct": round(fail * 100, 2),
+            "kill_pct": round(kill * 100, 2),
+            "per_step": per_step,
+            "p_complete_programme": round(completion, 4),
+            "expected_trades_to_complete": round(expected_trades, 1),
+        }
+    )
+    return stats
+
+
+def run_programme_from_config(
+    pct_returns: np.ndarray,
+    r_multiples: np.ndarray | None = None,
+    n_paths: int = DEFAULT_N_PATHS,
+    block_size: int = DEFAULT_BLOCK_SIZE,
+    seed: int = RANDOM_SEED,
+) -> dict:
+    """Convenience wrapper reading geometry from the active config profile."""
+    import config
+
+    return run_programme_monte_carlo(
+        pct_returns,
+        step_targets=tuple(config.PROGRAMME_STEPS),
+        fail=-abs(config.MAX_DRAWDOWN_LIMIT),
+        kill=-abs(config.KILL_SWITCH_PCT),
+        r_multiples=r_multiples,
+        n_paths=n_paths,
+        block_size=block_size,
+        seed=seed,
+    )
+
+
+def print_programme_report(result: dict, programme_label: str = "") -> None:
+    hdr = programme_label or f"{result['n_steps']}-step programme"
+    print(f"\nMONTE CARLO — {hdr} "
+          f"({result['n_paths']:,} block-bootstrap paths/step, block={result['block_size']})")
+    print(f"Geometry: steps {result['step_targets_pct']}%  "
+          f"kill −{abs(result['kill_pct'])}%  official −{abs(result['fail_pct'])}%")
+    print("-" * 64)
+    print(f"Source trades:            {result['trades']}  |  PF {result['profit_factor']}  "
+          f"|  expectancy {result['expectancy_pct']:.4f}%/trade")
+    for s in result["per_step"]:
+        mt = s["median_trades_to_pass"]
+        mt_s = f"{mt:.0f}" if mt == mt else "n/a"
+        print(f"  Step {s['step']} (+{s['target_pct']}%):  "
+              f"P(pass) {s['p_pass']*100:5.2f}%   "
+              f"P(kill) {s['p_kill_switch']*100:5.2f}%   "
+              f"P(breach) {s['p_breach_official']*100:4.2f}%   "
+              f"med trades {mt_s}")
+    print("-" * 64)
+    print(f"P(complete full programme): {result['p_complete_programme']*100:.2f}%")
+    print(f"Expected trades to complete: {result['expected_trades_to_complete']:.0f}")
+
+
+def print_step_report(result: dict, programme_label: str = "Bootcamp") -> None:
+    print(f"\nMONTE CARLO — {programme_label} first-step simulator "
           f"({result['n_paths']:,} block-bootstrap paths, block={result['block_size']})")
     print("-" * 60)
     print(f"Trades (source):          {result['trades']}")
@@ -249,9 +376,18 @@ def print_step_report(result: dict) -> None:
     print(f"Expectancy / trade:       {result['expectancy_pct']:.4f}%")
     print(f"Max drawdown (realized):  {result['max_drawdown_pct']:.2f}%")
     print(f"Longest losing streak:    {result['longest_losing_streak']}")
-    print(f"P(pass +6% before −5%):   {result['p_pass']*100:.2f}%")
-    print(f"P(hit −3% kill switch):   {result['p_kill_switch']*100:.2f}%")
-    print(f"P(breach −5% official):   {result['p_breach_official']*100:.2f}%")
+    print(
+        f"P(pass +{result['target_pct']}%):          "
+        f"{result['p_pass']*100:.2f}%"
+    )
+    print(
+        f"P(hit −{abs(result['kill_pct'])}% kill):    "
+        f"{result['p_kill_switch']*100:.2f}%"
+    )
+    print(
+        f"P(breach −{abs(result['fail_pct'])}%):      "
+        f"{result['p_breach_official']*100:.2f}%"
+    )
     print(f"P(incomplete path):       {result['p_incomplete']*100:.2f}%")
     if result["median_trades_to_pass"] == result["median_trades_to_pass"]:
         print(f"Median trades to pass:    {result['median_trades_to_pass']:.0f}")
