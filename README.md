@@ -4,6 +4,20 @@ A fully automated rules-first forex trading bot with selectable MetaTrader 5 (MT
 
 The strategy IS the rules (H1 EMA regime + M15 pullback entries in `strategy.py`); the XGBoost model survives only as an optional veto (`MetaVeto`) that can block candidates but never create them (off by default). **Demo testing only.**
 
+## Programme profiles (Cycle 6)
+
+The same frozen strategy can target either evaluation via the `PROGRAMME` env var — all barrier, kill-switch, pacing and risk constants derive from the selected profile in `config.py` (`PROGRAMMES`):
+
+- `bootcamp` (default) — 3 steps, +6% each, −5% static max loss, −3% kill, 0.30% risk.
+- `high_stakes` — 2 steps (+10%, +5%), −10% static max loss, −6% kill (−4% soft-reduce), 5% official daily loss (1.5% self-imposed pacing), ≥3 profitable days, 0.40% risk.
+
+Cycle-6 research (`cycle6_research_report.md`) shows the frozen edge models NO-GO on Bootcamp (~30% completion) but ~72% completion on High Stakes — the recommended route. Run either:
+
+```bash
+python backtest.py --go-no-go                     # Bootcamp
+PROGRAMME=high_stakes python backtest.py --go-no-go
+```
+
 ## Requirements
 - Python 3.11+
 - For MT5: Windows OS, MetaTrader 5 Terminal installed and running

@@ -21,10 +21,23 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import pandas as pd
 import config
 
 logger = logging.getLogger(__name__)
+
+
+def _news_source_tz() -> ZoneInfo:
+    """The IANA timezone Forex Factory renders event times in (config)."""
+    try:
+        return ZoneInfo(getattr(config, "NEWS_SOURCE_TZ", "UTC"))
+    except Exception:
+        logger.error(
+            "Invalid NEWS_SOURCE_TZ=%r — falling back to UTC.",
+            getattr(config, "NEWS_SOURCE_TZ", None),
+        )
+        return ZoneInfo("UTC")
 
 CACHE_FILE = config.DATA_DIR / "news_cache.json"
 CACHE_EXPIRY_HOURS = 6
@@ -107,11 +120,16 @@ def _parse_ff_html(html: str) -> pd.DataFrame:
             try:
                 # e.g., "2023 Sep 25 10:30am"
                 dt_naive = datetime.strptime(datetime_str, "%Y %b %d %I:%M%p")
-                
-                # Assume parsed time is in UTC for simplicity.
-                # In a robust production environment, one would force a timezone cookie on FF.
-                dt_utc = dt_naive.replace(tzinfo=timezone.utc)
-                
+
+                # Forex Factory renders times in the account/cookie timezone
+                # (config.NEWS_SOURCE_TZ), NOT UTC. Localize to that zone, then
+                # convert to UTC so downstream blackout math is correct
+                # regardless of how the FF session is configured (Finding 3).
+                dt_utc = (
+                    dt_naive.replace(tzinfo=_news_source_tz())
+                    .astimezone(timezone.utc)
+                )
+
                 events.append({
                     "datetime_utc": dt_utc,
                     "currency": currency,

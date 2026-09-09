@@ -1284,13 +1284,42 @@ def run_go_no_go(fast: bool = False) -> dict[str, Any]:
         )
 
     n_paths = 2_000 if fast else 20_000
-    mc = run_step_monte_carlo(engine.pct_returns(), engine.r_multiples(), n_paths=n_paths)
-    print_step_report(mc)
+    # Single-step view (retained; matches the active profile's first step).
+    mc = run_step_monte_carlo(
+        engine.pct_returns(),
+        engine.r_multiples(),
+        n_paths=n_paths,
+        target=config.PROGRAMME_STEPS[0],
+        fail=-abs(config.MAX_DRAWDOWN_LIMIT),
+        kill=-abs(config.KILL_SWITCH_PCT),
+    )
+    print_step_report(
+        mc,
+        getattr(config, "PROGRAMMES", {}).get(config.PROGRAMME, {}).get(
+            "label", config.PROGRAMME
+        ),
+    )
 
+    # Full-programme view, geometry driven by the active PROGRAMME profile
+    # (Bootcamp 3×+6% / −5% / −3%, or High Stakes +10%,+5% / −10% / −6%).
+    from monte_carlo_dd import run_programme_from_config, print_programme_report
+
+    prog = run_programme_from_config(
+        engine.pct_returns(), engine.r_multiples(), n_paths=n_paths
+    )
+    print_programme_report(prog, getattr(config, "PROGRAMMES", {}).get(
+        config.PROGRAMME, {}).get("label", config.PROGRAMME))
+
+    # GO gates use the WORST per-step kill probability and require every step's
+    # P(pass) above the gate — a programme is only as strong as its hardest step.
+    worst_step_kill = max(s["p_kill_switch"] for s in prog["per_step"])
+    worst_step_pass = min(s["p_pass"] for s in prog["per_step"])
+    worst_step_breach = max(s["p_breach_official"] for s in prog["per_step"])
+    off_lim = int(round(config.MAX_DRAWDOWN_LIMIT * 100))
     checks = {
-        "P(breach −5%) < 1%": mc["p_breach_official"] < 0.01,
-        "P(kill switch) < 10%": mc["p_kill_switch"] < 0.10,
-        "P(pass) > 70%": mc["p_pass"] > 0.70,
+        f"P(breach −{off_lim}%) < 1% (worst step)": worst_step_breach < 0.01,
+        "P(kill switch) < 10% (worst step)": worst_step_kill < 0.10,
+        "P(pass) > 70% (worst step)": worst_step_pass > 0.70,
         "PF ≥ 1.25 in every fold": all_folds_pf_ok,
     }
     verdict = "GO" if all(checks.values()) else "NO-GO"
@@ -1302,7 +1331,15 @@ def run_go_no_go(fast: bool = False) -> dict[str, Any]:
         print(f"  {'PASS' if passed else 'FAIL'}  {label}")
     print(f"\n  ➜ {verdict}" + ("" if verdict == "GO" else "  — do not run this on a challenge account."))
 
-    return {"verdict": verdict, "checks": checks, "metrics": metrics, "monte_carlo": mc, "folds": folds}
+    return {
+        "verdict": verdict,
+        "programme": config.PROGRAMME,
+        "checks": checks,
+        "metrics": metrics,
+        "monte_carlo": mc,
+        "programme_monte_carlo": prog,
+        "folds": folds,
+    }
 
 
 def _print_monte_carlo_block(result: dict) -> None:
