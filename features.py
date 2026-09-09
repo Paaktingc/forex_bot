@@ -340,6 +340,51 @@ def feature_engineering_h1(df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(subset=META_FEATURE_COLS).copy()
     return out
 
+def compute_regime_indicators_h1(df_h1: pd.DataFrame) -> pd.DataFrame:
+    """
+    H1 indicators for the rules-based regime filter:
+    EMA(50), EMA(200), ADX(14), ATR(14). Uses only completed-bar data.
+    """
+    out = df_h1.copy()
+    if "tick_volume" in out.columns and "volume" not in out.columns:
+        out["volume"] = out["tick_volume"]
+    close = out["close"]
+    out["ema_50"] = _ema(close, 50)
+    out["ema_200"] = _ema(close, 200)
+    out["adx_14"] = _adx(out, 14)
+    out["atr_14"] = _atr(out, 14)
+    return out
+
+
+def compute_entry_indicators_m15(df_m15: pd.DataFrame) -> pd.DataFrame:
+    """
+    M15 indicators for the rules-based entry trigger:
+    EMA(20), RSI(14), ATR(14). Uses only completed-bar data.
+    """
+    out = df_m15.copy()
+    if "tick_volume" in out.columns and "volume" not in out.columns:
+        out["volume"] = out["tick_volume"]
+    close = out["close"]
+    out["ema_20"] = _ema(close, 20)
+    out["rsi_14"] = _rsi_wilder(close, 14)
+    out["atr_14"] = _atr(out, 14)
+    return out
+
+
+def rolling_swing_levels(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """
+    Rolling swing extremes over the trailing ``window`` completed bars:
+    swing_high = max(high), swing_low = min(low). Causal (no future bars).
+    """
+    return pd.DataFrame(
+        {
+            "swing_high": df["high"].rolling(window, min_periods=window).max(),
+            "swing_low": df["low"].rolling(window, min_periods=window).min(),
+        },
+        index=df.index,
+    )
+
+
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Computes technical indicators using pandas/numpy only.
@@ -417,37 +462,30 @@ def compute_session_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_h1_trend(df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> pd.DataFrame:
     """
-    Aligns H1 EMA(50) backwards to M15 timeframe to determine trend.
+    Aligns H1 EMA(50) onto the M15 timeframe to determine trend.
     +1 if H1 close > H1 EMA50, else -1.
+
+    Leak-free alignment: H1 bars are left-labelled, so their close/EMA are only
+    known at label + 1h. align_last_closed_bar attaches the most recently CLOSED
+    H1 bar to each M15 timestamp (see htf_alignment / research_log.md Gate 0).
+    Previously this used merge_asof(direction="backward") on the H1 label, which
+    attached the still-forming H1 bar (future close) — the same structural leak
+    that invalidated the H1 regime strategy.
     """
+    from htf_alignment import align_last_closed_bar
+
     df_h1_out = df_h1.copy()
     df_h1_out["EMA_50"] = _ema(df_h1_out["close"], 50)
     if df_h1_out["EMA_50"].isna().all():
         df_h1_out['EMA_50'] = df_h1_out['close']
-    
-    m15_reset = df_m15.reset_index()
-    h1_reset = df_h1_out.reset_index()
-    
-    # Normalize reset-index datetime column names for merge_asof.
-    if 'time' not in m15_reset.columns:
-        first_col = m15_reset.columns[0]
-        m15_reset = m15_reset.rename(columns={first_col: 'time'})
-    if 'time' not in h1_reset.columns:
-        first_col = h1_reset.columns[0]
-        h1_reset = h1_reset.rename(columns={first_col: 'time'})
-        
-    merged = pd.merge_asof(
-        m15_reset.sort_values('time'),
-        h1_reset[['time', 'close', 'EMA_50']].sort_values('time'),
-        on='time',
-        direction='backward',
-        suffixes=('', '_h1')
+
+    aligned = align_last_closed_bar(
+        df_m15.index, df_h1_out[["close", "EMA_50"]], columns=["close", "EMA_50"]
     )
-    
-    # Add h1_trend: +1 if H1 close > H1 EMA50, else -1
-    merged['h1_trend'] = np.where(merged['close_h1'] > merged['EMA_50'], 1, -1)
-    
-    merged.set_index('time', inplace=True)
+    merged = df_m15.copy()
+    merged["close_h1"] = aligned["close"].to_numpy()
+    merged["EMA_50"] = aligned["EMA_50"].to_numpy()
+    merged["h1_trend"] = np.where(merged["close_h1"] > merged["EMA_50"], 1, -1)
     return merged
 
 def build_feature_matrix(df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> pd.DataFrame:

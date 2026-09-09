@@ -183,7 +183,12 @@ class CTraderBrokerAdapter(BrokerAdapter):
         if df.empty:
             return df
         df.set_index("time", inplace=True)
-        return df[["open", "high", "low", "close", "volume"]].dropna()
+        df = df[["open", "high", "low", "close", "volume"]].dropna()
+        # Drop the still-forming trendbar so callers only ever see CLOSED bars
+        # (Finding 6). strategy.generate_candidate assumes iloc[-1] is closed.
+        from bar_utils import drop_forming_bar
+
+        return drop_forming_bar(df, minutes)
 
     def get_latest_tick(self, symbol: str) -> dict[str, float]:
         self._require_connected()

@@ -3,7 +3,13 @@ execution.py
 
 Order placement, position management, and emergency close logic.
 Rules enforced here:
+  - EVERY order must carry a broker-visible stop loss (The5ers requirement);
+    orders without a valid SL are rejected here, not just in the strategy
+  - market orders only — pending orders (incl. straddles around news) are
+    not supported by design
   - 2-second minimum delay between consecutive order placements
+  - SL modifications (breakeven moves) are rate-limited per ticket and
+    applied at most once (The5ers bans EAs that spam order modifications)
   - try/except on broker calls
   - MT5 orders tagged with BOT_MAGIC_NUMBER for isolation
 """
@@ -30,6 +36,30 @@ UTC = timezone.utc
 
 # Module-level timestamp of the last order send (for 2 s throttle)
 _last_order_time: Optional[float] = None
+
+# Breakeven bookkeeping: tickets already moved + per-ticket last SL change
+_be_applied_tickets: set[int] = set()
+_last_modify_time: dict[int, float] = {}
+
+
+def _valid_stop_loss(signal: int, sl_price, tp_price) -> bool:
+    """
+    A broker-visible SL is mandatory on every order. Validates that sl_price
+    is a positive finite number on the LOSS side of the trade (below TP for
+    buys, above TP for sells).
+    """
+    try:
+        sl = float(sl_price)
+        tp = float(tp_price)
+    except (TypeError, ValueError):
+        return False
+    if not (sl > 0 and sl == sl and tp == tp):  # NaN-safe
+        return False
+    if signal == 1:
+        return sl < tp
+    if signal == -1:
+        return sl > tp
+    return False
 
 
 def _require_mt5() -> None:
@@ -81,6 +111,14 @@ def place_order(
     Returns:
         dict with ticket, price, sl, tp, volume, time — or None on failure.
     """
+    if not _valid_stop_loss(signal, sl_price, tp_price):
+        logger.error(
+            f"place_order REJECTED: order without a valid broker-visible SL "
+            f"(symbol={symbol} signal={signal} sl={sl_price} tp={tp_price}). "
+            f"The5ers requires a stop loss on every position."
+        )
+        return None
+
     if _use_broker_adapter():
         return get_broker().place_order(symbol, signal, lot, sl_price, tp_price)
 
@@ -331,7 +369,129 @@ def check_min_duration(ticket: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 6. close_all_positions
+# 6. modify_position_sl / manage_breakeven
+# ---------------------------------------------------------------------------
+
+def modify_position_sl(ticket: int, new_sl: float) -> bool:
+    """
+    Moves the stop loss of an open position. Rate-limited per ticket
+    (config.BE_MODIFY_MIN_INTERVAL_S) so the bot never spams modifications.
+    The SL is never removed — new_sl must be a positive price.
+    """
+    if not new_sl or new_sl <= 0:
+        logger.error(f"modify_position_sl: refusing to set invalid SL {new_sl}.")
+        return False
+
+    now = time.monotonic()
+    last = _last_modify_time.get(ticket)
+    if last is not None and now - last < config.BE_MODIFY_MIN_INTERVAL_S:
+        logger.info(
+            f"modify_position_sl: rate limit — ticket {ticket} modified "
+            f"{now - last:.0f}s ago (min {config.BE_MODIFY_MIN_INTERVAL_S}s)."
+        )
+        return False
+
+    if _use_broker_adapter():
+        broker = get_broker()
+        modify = getattr(broker, "modify_position_sl", None)
+        if modify is None:
+            logger.warning(
+                "modify_position_sl: broker adapter has no SL modification "
+                "support — skipping breakeven move."
+            )
+            return False
+        ok = bool(modify(ticket, new_sl))
+        if ok:
+            _last_modify_time[ticket] = now
+        return ok
+
+    _require_mt5()
+    try:
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            logger.error(f"modify_position_sl: ticket {ticket} not found.")
+            return False
+        pos = positions[0]
+
+        request = {
+            "action":   mt5.TRADE_ACTION_SLTP,
+            "symbol":   pos.symbol,
+            "position": ticket,
+            "sl":       float(new_sl),
+            "tp":       float(pos.tp),
+            "magic":    config.BOT_MAGIC_NUMBER,
+        }
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            retcode = result.retcode if result else "None"
+            logger.error(
+                f"modify_position_sl: failed — ticket={ticket} retcode={retcode} "
+                f"MT5 error: {mt5.last_error()}"
+            )
+            return False
+
+        _last_modify_time[ticket] = now
+        logger.info(f"modify_position_sl: ticket={ticket} SL → {new_sl}")
+        return True
+
+    except Exception as exc:
+        logger.exception(f"modify_position_sl: unexpected error for {ticket}: {exc}")
+        return False
+
+
+def manage_breakeven(symbol: Optional[str] = None) -> int:
+    """
+    Once a position is +BE_AT_R (1.0R) in profit, moves its SL to the entry
+    price. Applied at most ONCE per ticket and rate-limited via
+    modify_position_sl. Returns the number of positions moved.
+    """
+    from data_feed import get_latest_tick
+
+    moved = 0
+    for pos in get_open_positions(symbol):
+        ticket = int(pos["ticket"])
+        if ticket in _be_applied_tickets:
+            continue
+
+        entry = float(pos["open_price"])
+        sl = float(pos["sl"] or 0.0)
+        if sl <= 0:
+            logger.error(
+                f"manage_breakeven: position {ticket} has NO stop loss — "
+                f"this should be impossible; skipping."
+            )
+            continue
+
+        is_buy = int(pos["type"]) == 0
+        risk = (entry - sl) if is_buy else (sl - entry)
+        if risk <= 0:
+            continue  # SL already at/beyond breakeven
+
+        try:
+            tick = get_latest_tick(pos["symbol"])
+            current = float(tick["bid"]) if is_buy else float(tick["ask"])
+        except Exception as exc:
+            logger.warning(f"manage_breakeven: no tick for {pos['symbol']}: {exc}")
+            continue
+
+        trigger = entry + config.BE_AT_R * risk if is_buy else entry - config.BE_AT_R * risk
+        reached = current >= trigger if is_buy else current <= trigger
+        if not reached:
+            continue
+
+        if modify_position_sl(ticket, entry):
+            _be_applied_tickets.add(ticket)
+            moved += 1
+            logger.info(
+                f"manage_breakeven: ticket={ticket} reached +{config.BE_AT_R}R — "
+                f"SL moved to breakeven {entry}."
+            )
+
+    return moved
+
+
+# ---------------------------------------------------------------------------
+# 7. close_all_positions
 # ---------------------------------------------------------------------------
 
 def close_all_positions() -> int:

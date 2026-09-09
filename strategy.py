@@ -1,0 +1,440 @@
+"""
+strategy.py
+
+Rules-based signal engine for the The5ers Bootcamp bot — the strategy IS the
+rules; the ML model survives only as an optional veto (model.MetaVeto).
+
+Regime (H1):
+  long  iff EMA50 > EMA200 and close > EMA50
+  short iff EMA50 < EMA200 and close < EMA50
+  plus ADX(14) >= ADX_MIN gate (config.USE_ADX_GATE). No regime → no signal.
+
+Entry (M15, regime direction only):
+  pullback touches the M15 EMA20 (or the 38.2–61.8% retracement of the last
+  H1 swing) within the lookback window, then an M15 close back in the trend
+  direction with RSI(14) recrossing 50 → market order at next candle open.
+
+All indicator math lives in features.py; this module only combines it.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+
+import config
+from features import (
+    compute_entry_indicators_m15,
+    compute_regime_indicators_h1,
+    rolling_swing_levels,
+)
+from htf_alignment import align_last_closed_bar
+
+logger = logging.getLogger(__name__)
+
+# ~20 trading days of M15 bars, for the ATR-vs-median volatility filter
+_BARS_PER_DAY_M15 = 96
+ATR_MEDIAN_WINDOW_BARS = 20 * _BARS_PER_DAY_M15
+
+RETRACEMENT_SHALLOW = 0.382
+RETRACEMENT_DEEP = 0.618
+
+# --- Strategy retirement registry -------------------------------------------
+# The H1 regime strategy (entry modes below) is INVALIDATED by structural
+# higher-timeframe look-ahead leakage (research_log.md Gate 0 / commit 9b49079
+# and the alignment-fix commit). With leak-free closed-bar alignment its
+# expectancy is materially NEGATIVE across EURUSD/GBPUSD/AUDUSD/USDJPY, so it
+# must never emit a live or demo signal. Research reproduction stays available
+# through build_signal_frame / research_ablation / the backtest engine, which
+# do NOT pass through this guard.
+RETIRED_ENTRY_MODES = frozenset({"regime_daily", "regime_daily2"})
+
+
+class RetiredStrategyError(RuntimeError):
+    """Raised when a retired strategy is enabled for live/demo trading."""
+
+
+def assert_live_entry_mode_enabled(entry_mode: str) -> None:
+    """Fail fast if a retired strategy is configured for live/demo trading.
+
+    Called at bot startup (main.initialize_bot). Research/backtest paths do not
+    call this, so historical reproduction remains possible.
+    """
+    if entry_mode in RETIRED_ENTRY_MODES:
+        raise RetiredStrategyError(
+            f"entry_mode {entry_mode!r} is RETIRED: invalidated by higher-"
+            "timeframe look-ahead leakage; leak-free expectancy is negative "
+            "across all tested FX pairs. It must not trade live or demo. See "
+            "research/h1_regime_invalidation/README.md and research_log.md."
+        )
+
+
+@dataclass(frozen=True)
+class StrategyParams:
+    """Tunable rule parameters (perturbed in walk-forward robustness runs)."""
+
+    ema_fast_h1: int = 50
+    ema_slow_h1: int = 200
+    ema_pullback: int = 20
+    rsi_period: int = 14
+    rsi_level: float = 50.0
+    adx_min: float = field(default_factory=lambda: config.ADX_MIN)
+    use_adx_gate: bool = field(default_factory=lambda: config.USE_ADX_GATE)
+    pullback_lookback: int = 12          # M15 bars (~3 hours)
+    swing_window_h1: int = 20            # H1 bars for the retracement swing
+    sl_atr_mult: float = field(default_factory=lambda: config.SL_ATR_MULT)
+    tp_r: float = field(default_factory=lambda: config.TP_R)
+    # "pullback_rsi": M15 pullback + RSI-recross confirmation (original)
+    # "regime_daily": one entry at the first in-session bar each London day
+    #                 while the H1 regime holds; SL anchored at entry.
+    #                 Adopted from the 2026-07 component ablation — see
+    #                 research_log.md Phase 2c.
+    entry_mode: str = field(default_factory=lambda: config.ENTRY_MODE)
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """A rules-generated trade candidate (before filters / veto / risk)."""
+
+    direction: int                       # 1 buy, -1 sell
+    signal_time: pd.Timestamp            # close time of the trigger M15 bar
+    swing_price: float | None            # pullback extreme (SL anchor); None
+                                         # → SL anchored at the entry price
+    atr: float                           # M15 ATR(14) at signal time
+    atr_median: float | None = None      # trailing 20-day ATR median (vol filter)
+    reason: str = "H1 regime + M15 pullback"
+
+
+# ---------------------------------------------------------------------------
+# Indicator assembly
+# ---------------------------------------------------------------------------
+
+def _ema_with_span(close: pd.Series, span: int) -> pd.Series:
+    return close.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+def entry_session_mask(index: pd.DatetimeIndex) -> np.ndarray:
+    """
+    Vectorized equivalent of entry_session_ok for a UTC DatetimeIndex:
+    Mon–Fri 08:00–17:00 Europe/London, Friday cut at FRIDAY_CUTOFF_LONDON.
+    """
+    local = index.tz_convert(ZoneInfo(config.LONDON_TZ))
+    hours = np.asarray(local.hour)
+    weekdays = np.asarray(local.weekday)
+    ok = (
+        (weekdays < 5)
+        & (hours >= config.SESSION_START_LONDON)
+        & (hours < config.SESSION_END_LONDON)
+    )
+    ok &= ~((weekdays == 4) & (hours >= config.FRIDAY_CUTOFF_LONDON))
+    return ok
+
+
+def h1_regime(df_h1: pd.DataFrame, params: StrategyParams | None = None) -> pd.Series:
+    """
+    Per-H1-bar regime: +1 long, -1 short, 0 none. ADX gate applied when
+    enabled. Uses only the completed bar's values.
+    """
+    params = params or StrategyParams()
+    ind = compute_regime_indicators_h1(df_h1)
+    close = ind["close"]
+    ema_fast = _ema_with_span(close, params.ema_fast_h1)
+    ema_slow = _ema_with_span(close, params.ema_slow_h1)
+
+    regime = pd.Series(0, index=ind.index, dtype=int)
+    regime[(ema_fast > ema_slow) & (close > ema_fast)] = 1
+    regime[(ema_fast < ema_slow) & (close < ema_fast)] = -1
+
+    if params.use_adx_gate:
+        regime[~(ind["adx_14"] >= params.adx_min)] = 0
+
+    regime[ema_slow.isna()] = 0
+    return regime
+
+
+def build_signal_frame(
+    df_m15: pd.DataFrame,
+    df_h1: pd.DataFrame,
+    params: StrategyParams | None = None,
+) -> pd.DataFrame:
+    """
+    Vectorized signal generation over a full M15 history (used by the
+    backtester and, on the latest rows, by the live loop).
+
+    Returns a frame indexed like df_m15 with columns:
+      signal        +1/-1/0 at the trigger bar's close
+      swing_price   pullback extreme for SL anchoring (NaN when no signal)
+      atr_14        M15 ATR at the trigger bar
+      atr_median    trailing 20-day median of atr_14 (volatility filter)
+    """
+    params = params or StrategyParams()
+
+    m15 = compute_entry_indicators_m15(df_m15)
+    close = m15["close"]
+    ema_pull = _ema_with_span(close, params.ema_pullback)
+    rsi = (
+        m15["rsi_14"]
+        if params.rsi_period == 14
+        else _wilder_rsi(close, params.rsi_period)
+    )
+
+    # H1 regime and last-H1-swing retracement zone, aligned onto M15 using
+    # CLOSED-bar availability. H1 bars are left-labelled (label = open time), so
+    # their features are only known at label + 1h. Aligning on the label with a
+    # backward merge_asof would attach a still-forming H1 bar (whose eventual
+    # close is future information) — the structural look-ahead leak documented
+    # in research_log.md (Gate 0). align_last_closed_bar enforces
+    # `H1.available_at (= open + timeframe) <= M15 decision timestamp`.
+    regime_h1 = h1_regime(df_h1, params)
+    swings_h1 = rolling_swing_levels(df_h1, params.swing_window_h1)
+    h1_frame = pd.DataFrame(
+        {
+            "regime": regime_h1,
+            "swing_high_h1": swings_h1["swing_high"],
+            "swing_low_h1": swings_h1["swing_low"],
+        }
+    )
+    aligned = align_last_closed_bar(m15.index, h1_frame)
+    regime = aligned["regime"].fillna(0).astype(int)
+    swing_high_h1 = aligned["swing_high_h1"]
+    swing_low_h1 = aligned["swing_low_h1"]
+
+    h1_range = (swing_high_h1 - swing_low_h1).replace(0, np.nan)
+    # Long: pullback into 38.2–61.8% below the swing high; short mirrored
+    long_zone_top = swing_high_h1 - RETRACEMENT_SHALLOW * h1_range
+    long_zone_bottom = swing_high_h1 - RETRACEMENT_DEEP * h1_range
+    short_zone_bottom = swing_low_h1 + RETRACEMENT_SHALLOW * h1_range
+    short_zone_top = swing_low_h1 + RETRACEMENT_DEEP * h1_range
+
+    low = m15["low"]
+    high = m15["high"]
+
+    long_touch = (low <= ema_pull) | ((low <= long_zone_top) & (high >= long_zone_bottom))
+    short_touch = (high >= ema_pull) | ((high >= short_zone_bottom) & (low <= short_zone_top))
+
+    lookback = params.pullback_lookback
+    long_pullback = (
+        long_touch.astype(float).rolling(lookback, min_periods=1).max()
+        .shift(1).fillna(0.0).astype(bool)
+    )
+    short_pullback = (
+        short_touch.astype(float).rolling(lookback, min_periods=1).max()
+        .shift(1).fillna(0.0).astype(bool)
+    )
+
+    rsi_prev = rsi.shift(1)
+    long_trigger = (
+        (regime == 1)
+        & long_pullback
+        & (close > ema_pull)
+        & (rsi > params.rsi_level)
+        & (rsi_prev <= params.rsi_level)
+    )
+    short_trigger = (
+        (regime == -1)
+        & short_pullback
+        & (close < ema_pull)
+        & (rsi < params.rsi_level)
+        & (rsi_prev >= params.rsi_level)
+    )
+
+    signal = pd.Series(0, index=m15.index, dtype=int)
+    swing_price = pd.Series(np.nan, index=m15.index, dtype=float)
+    swing_low_m15 = low.rolling(lookback + 1, min_periods=1).min()
+    swing_high_m15 = high.rolling(lookback + 1, min_periods=1).max()
+
+    if params.entry_mode == "range_fade":
+        # Family 2 (research_log.md cycle 4): failed-breakout fade of the
+        # Asian range on NO-regime days — orthogonal to the regime family
+        # by construction. Asian range = 00:00–07:59 London (≥12 bars).
+        # In the 08:00–10:59 London window: poke above the Asian high with
+        # a close back inside → SHORT at next open (mirror for longs).
+        # SL anchors at the poke extreme via the normal swing machinery.
+        lon = m15.index.tz_convert(ZoneInfo(config.LONDON_TZ))
+        dates = pd.Series(lon.date, index=m15.index)
+        is_asia = pd.Series((lon.hour >= 0) & (lon.hour < 8), index=m15.index)
+        asia_high = high.where(is_asia).groupby(dates).transform("max")
+        asia_low = low.where(is_asia).groupby(dates).transform("min")
+        asia_bars = is_asia.groupby(dates).transform("sum")
+        range_ok = (asia_bars >= 12) & asia_high.notna() & asia_low.notna()
+
+        next_bar_time = m15.index + pd.Timedelta(minutes=15)
+        lon_next = next_bar_time.tz_convert(ZoneInfo(config.LONDON_TZ))
+        fade_window = pd.Series(
+            entry_session_mask(next_bar_time), index=m15.index
+        ) & pd.Series((lon_next.hour >= 8) & (lon_next.hour < 11), index=m15.index)
+
+        no_regime = regime == 0
+        short_fade = (
+            fade_window & no_regime & range_ok
+            & (high > asia_high) & (close < asia_high)
+        )
+        long_fade = (
+            fade_window & no_regime & range_ok
+            & (low < asia_low) & (close > asia_low)
+        )
+        eligible = short_fade | long_fade
+        entry_dates = pd.Series(lon_next.date, index=m15.index)
+        first_eligible = eligible & ~entry_dates.where(eligible).duplicated()
+
+        signal[first_eligible & short_fade] = -1
+        signal[first_eligible & long_fade] = 1
+        swing_price[first_eligible & short_fade] = high[first_eligible & short_fade]
+        swing_price[first_eligible & long_fade] = low[first_eligible & long_fade]
+    elif params.entry_mode in ("regime_daily", "regime_daily2"):
+        # One candidate per London day: the signal sits on the bar whose
+        # NEXT scheduled bar (close time + 15 min, known from the clock —
+        # no lookahead) is in-session, while the H1 regime holds at this
+        # bar's close. Only the day's FIRST such bar signals; no
+        # later-in-day retries — the Phase-2c ablation showed the edge
+        # lives in the day's first regime-valid bar and later entries
+        # dilute it (research_log.md, configs #1/#1b/#1c). SL anchors at
+        # the entry (swing stays NaN).
+        next_bar_time = m15.index + pd.Timedelta(minutes=15)
+        session_next = pd.Series(entry_session_mask(next_bar_time), index=m15.index)
+        eligible = session_next & (regime != 0)
+        local_next = next_bar_time.tz_convert(ZoneInfo(config.LONDON_TZ))
+        entry_dates = pd.Series(local_next.date, index=m15.index)
+        first_eligible = eligible & ~entry_dates.where(eligible).duplicated()
+        signal_bars = first_eligible
+        if params.entry_mode == "regime_daily2":
+            # Second anchor: the first regime-valid bar at/after 13:00
+            # London (NY-open overlap). Same rules; the global 2-trades/day
+            # cap applies. May coincide with the first anchor (then it is
+            # a single signal).
+            afternoon = eligible & pd.Series(local_next.hour >= 13, index=m15.index)
+            first_pm = afternoon & ~entry_dates.where(afternoon).duplicated()
+            signal_bars = first_eligible | first_pm
+        signal[signal_bars] = regime[signal_bars]
+    else:
+        signal[long_trigger] = 1
+        signal[short_trigger] = -1
+        # SL anchor: the pullback extreme over the lookback window incl.
+        # the trigger bar
+        swing_price[long_trigger] = swing_low_m15[long_trigger]
+        swing_price[short_trigger] = swing_high_m15[short_trigger]
+
+    atr = m15["atr_14"]
+    return pd.DataFrame(
+        {
+            "signal": signal,
+            "swing_price": swing_price,
+            "atr_14": atr,
+            "atr_median": atr.rolling(
+                ATR_MEDIAN_WINDOW_BARS, min_periods=_BARS_PER_DAY_M15 * 5
+            ).median(),
+            # diagnostic columns (funnel instrumentation / ablations)
+            "regime": regime,
+            "ema_pull": ema_pull,
+            "rsi": rsi,
+            "long_touch": long_touch,
+            "short_touch": short_touch,
+            "long_pullback": long_pullback,
+            "short_pullback": short_pullback,
+            "swing_low": swing_low_m15,
+            "swing_high": swing_high_m15,
+        },
+        index=m15.index,
+    )
+
+
+def _wilder_rsi(close: pd.Series, period: int) -> pd.Series:
+    delta = close.diff()
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
+    avg_gain = gains.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    avg_loss = losses.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def generate_candidate(
+    df_m15: pd.DataFrame,
+    df_h1: pd.DataFrame,
+    params: StrategyParams | None = None,
+) -> Candidate | None:
+    """
+    Evaluates the LAST CLOSED M15 bar and returns a Candidate when the rules
+    fire (execution happens at the next candle open), else None.
+    """
+    if df_m15 is None or df_m15.empty or df_h1 is None or df_h1.empty:
+        return None
+
+    frame = build_signal_frame(df_m15, df_h1, params)
+    last = frame.iloc[-1]
+    if int(last["signal"]) == 0:
+        return None
+    if not np.isfinite(last["atr_14"]):
+        return None
+
+    swing = float(last["swing_price"]) if np.isfinite(last["swing_price"]) else None
+    atr_median = float(last["atr_median"]) if np.isfinite(last["atr_median"]) else None
+    return Candidate(
+        direction=int(last["signal"]),
+        signal_time=frame.index[-1],
+        swing_price=swing,
+        atr=float(last["atr_14"]),
+        atr_median=atr_median,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry filters (spread / volatility / session)
+# ---------------------------------------------------------------------------
+
+def spread_ok(spread_pips: float) -> bool:
+    """Skip entries when the live spread exceeds MAX_SPREAD_PIPS."""
+    return 0 <= spread_pips <= config.MAX_SPREAD_PIPS
+
+
+def volatility_ok(atr_pips: float, atr_median_pips: float | None) -> bool:
+    """
+    Skip when ATR(14, M15) < ATR_MIN_PIPS (dead market) or when ATR exceeds
+    ATR_MAX_MEDIAN_MULT × its 20-day median (chaotic market).
+    """
+    if not np.isfinite(atr_pips) or atr_pips < config.ATR_MIN_PIPS:
+        return False
+    if atr_median_pips is not None and np.isfinite(atr_median_pips) and atr_median_pips > 0:
+        if atr_pips > config.ATR_MAX_MEDIAN_MULT * atr_median_pips:
+            return False
+    return True
+
+
+def entry_session_ok(when: datetime | pd.Timestamp) -> bool:
+    """
+    Entries only 08:00–17:00 Europe/London, Monday–Friday (DST-aware via
+    zoneinfo). Additionally blocked:
+      - Friday after FRIDAY_CUTOFF_LONDON (15:00 London)
+      - the first SUNDAY_OPEN_BLOCK_HOURS after the Sunday market open
+        (Sunday is fully outside the London window anyway)
+    The 21:45–00:15 server-time window is enforced by the risk manager.
+    """
+    if isinstance(when, pd.Timestamp):
+        when = when.to_pydatetime()
+    if when.tzinfo is None:
+        raise ValueError("entry_session_ok requires a timezone-aware datetime")
+
+    local = when.astimezone(ZoneInfo(config.LONDON_TZ))
+    weekday = local.weekday()  # Mon=0 … Sun=6
+
+    if weekday >= 5:  # Saturday/Sunday (covers the Sunday-open block)
+        return False
+    # Monday first hours can still be within N hours of the Sunday open
+    sunday_open_local = (local - timedelta(days=weekday + 1)).replace(
+        hour=22, minute=0, second=0, microsecond=0
+    )
+    if timedelta(0) <= local - sunday_open_local < timedelta(
+        hours=config.SUNDAY_OPEN_BLOCK_HOURS
+    ):
+        return False
+
+    if not (config.SESSION_START_LONDON <= local.hour < config.SESSION_END_LONDON):
+        return False
+    if weekday == 4 and local.hour >= config.FRIDAY_CUTOFF_LONDON:
+        return False
+    return True

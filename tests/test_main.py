@@ -1,20 +1,21 @@
 """
 test_main.py
 
-Unit tests for main.py. Tests the orchestration logic using mocks.
+Unit tests for main.py — the inverted rules-first flow:
+strategy candidate → filters → optional MetaVeto → risk → execution.
 """
 
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import patch, MagicMock
 
 import pytest
 import pandas as pd
-import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import strategy
 from main import (
     initialize_bot,
     process_candle,
@@ -25,18 +26,41 @@ from main import (
 
 UTC = timezone.utc
 
+IN_SESSION = datetime(2026, 1, 14, 10, 0, tzinfo=UTC)  # Wednesday 10:00 London
+
+
+def _candidate(direction=1):
+    return strategy.Candidate(
+        direction=direction,
+        signal_time=pd.Timestamp("2026-01-14 09:45:00+00:00"),
+        swing_price=1.0995 if direction == 1 else 1.1010,
+        atr=0.0008,           # 8 pips → SL ≈ 12–17 pips (inside clamp)
+        atr_median=0.0007,
+    )
+
+
+def _fresh_state(tmp_path, equity=10_000.0, meta_veto=None):
+    from risk_manager import RiskManager
+
+    return BotState(
+        starting_balance=equity,
+        risk=RiskManager(equity, disabled_flag_path=tmp_path / "d.json"),
+        meta_veto=meta_veto,
+    )
+
+
+def _mock_session(monkeypatch):
+    monkeypatch.setattr("main.datetime", MagicMock(now=lambda tz=None: IN_SESSION))
+
 
 # ---------------------------------------------------------------------------
 # get_current_m15_time
 # ---------------------------------------------------------------------------
 
 def test_get_current_m15_time_rounds_down():
-    """M15 boundary should round down to nearest 15 min."""
     fake_now = datetime(2024, 6, 15, 14, 37, 22, tzinfo=UTC)
     with patch("main.datetime") as mock_dt:
         mock_dt.now.return_value = fake_now
-        # .replace should be forwarded to the real datetime method
-        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
         result = get_current_m15_time()
     assert result.minute == 30
     assert result.second == 0
@@ -46,174 +70,286 @@ def test_get_current_m15_time_rounds_down():
 # initialize_bot
 # ---------------------------------------------------------------------------
 
-@patch("main.model_module.load_model")
 @patch("main.data_feed.connect_broker")
-def test_initialize_bot(mock_connect, mock_load, capsys):
+def test_initialize_bot_rules_only(mock_connect, capsys, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "USE_META_VETO", False)
+    # The default ENTRY_MODE (regime_daily) is retired; use a non-retired mode
+    # to exercise broker/risk startup.
+    monkeypatch.setattr(config, "ENTRY_MODE", "pullback_rsi", raising=False)
     mock_connect.return_value = 10_000.0
-    mock_model = MagicMock()
-    mock_le = MagicMock()
-    mock_load.return_value = (mock_model, mock_le)
 
     state = initialize_bot(dry_run=True)
 
     assert state.starting_balance == 10_000.0
-    assert state.model is mock_model
-    assert state.label_encoder is mock_le
+    assert state.meta_veto is None       # no model load in rules-only mode
     assert state.is_running is True
 
-    # Startup banner should print
     captured = capsys.readouterr()
-    assert "THE5ERS ML FOREX BOT" in captured.out
+    assert "BOOTCAMP RULES BOT" in captured.out
     assert "DRY-RUN" in captured.out
+    assert "MetaVeto: OFF" in captured.out
+
+
+@patch("main.data_feed.connect_broker")
+def test_initialize_bot_survives_missing_meta_model(mock_connect, monkeypatch):
+    """USE_META_VETO with no model artifacts must degrade to rules-only."""
+    import config
+
+    monkeypatch.setattr(config, "USE_META_VETO", True)
+    monkeypatch.setattr(config, "ENTRY_MODE", "pullback_rsi", raising=False)
+    mock_connect.return_value = 10_000.0
+
+    with patch("model.MetaVeto.load", side_effect=FileNotFoundError("no model")):
+        state = initialize_bot(dry_run=True)
+
+    assert state.meta_veto is None
 
 
 # ---------------------------------------------------------------------------
-# process_candle — full dry-run path
+# process_candle — dry-run happy path
 # ---------------------------------------------------------------------------
 
 @patch("main.trade_journal")
 @patch("main.execution")
-@patch("main.features")
 @patch("main.news_filter")
 @patch("main.data_feed")
-def test_process_candle_dry_run_logs_signal(
-    mock_data_feed, mock_news, mock_features,
-    mock_execution, mock_journal, caplog,
+def test_process_candle_dry_run_logs_candidate(
+    mock_data_feed, mock_news, mock_execution, mock_journal,
+    caplog, tmp_path, monkeypatch,
 ):
-    """When all checks pass and model returns a signal, dry-run should log but not place order."""
     mock_data_feed.get_account_info.return_value = {"equity": 10_000.0}
-
-    # Execution: no open trades
+    mock_data_feed.get_latest_tick.return_value = {"ask": 1.1001, "bid": 1.1000}
+    mock_data_feed.get_ohlcv.return_value = pd.DataFrame({"close": [1.1]})
     mock_execution.count_open_trades.return_value = 0
-
-    # News filter: no news
+    mock_execution.get_open_positions.return_value = []
     mock_news.is_news_window.return_value = False
 
-    # Features
-    feature_series = pd.Series(
-        np.random.randn(21),
-        index=[f"feat_{i}" for i in range(21)],
-    )
-    mock_features.get_live_features.return_value = feature_series
-
-    # Model prediction
-    mock_model = MagicMock()
-    mock_le = MagicMock()
-
-    from risk_manager import RiskManager
-    risk = RiskManager(10_000.0)
-
-    state = BotState(
-        starting_balance=10_000.0,
-        model=mock_model,
-        label_encoder=mock_le,
-        risk=risk,
+    state = _fresh_state(tmp_path)
+    state.risk.sync_counters_from_journal = lambda: None
+    _mock_session(monkeypatch)
+    monkeypatch.setattr("main.strategy.entry_session_ok", lambda ts: True)
+    monkeypatch.setattr(
+        "main.strategy.generate_candidate", lambda m15, h1, params=None: _candidate()
     )
 
-    # Mock model_module.predict_signal to return BUY
-    with patch("main.model_module.predict_signal", return_value=(1, 0.85)):
-        # Mock data_feed.get_ohlcv for ATR
-        ohlcv_df = pd.DataFrame({
-            "open": [1.1] * 20,
-            "high": [1.11] * 20,
-            "low": [1.09] * 20,
-            "close": [1.10] * 20,
-            "volume": [100] * 20,
-        })
-        mock_data_feed.get_ohlcv.return_value = ohlcv_df
+    import logging
+    with patch("risk_manager.is_rollover_window", return_value=False), \
+         patch("risk_manager.is_no_trade_server_window", return_value=False), \
+         caplog.at_level(logging.INFO, logger="main"):
+        process_candle(state, dry_run=True)
 
-        # Mock features.compute_indicators
-        ind_df = ohlcv_df.copy()
-        ind_df["atr_14"] = 0.001
-        mock_features.compute_indicators.return_value = ind_df
-
-        # Mock tick
-        mock_data_feed.get_latest_tick.return_value = {"ask": 1.1001, "bid": 1.1000}
-
-        # Rollover: not in window
-        with patch("risk_manager.is_rollover_window", return_value=False):
-            import logging
-            with caplog.at_level(logging.INFO, logger="main"):
-                process_candle(state, dry_run=True)
-
-    # Should NOT place any real order
     mock_execution.place_order.assert_not_called()
-
-    # Should log DRY RUN
     assert any("[DRY RUN]" in record.message for record in caplog.records)
 
 
+# ---------------------------------------------------------------------------
+# process_candle — gates and filters short-circuit
+# ---------------------------------------------------------------------------
+
 @patch("main.execution")
 @patch("main.news_filter")
-def test_process_candle_blocked_by_news_filter(
-    mock_news, mock_execution,
-):
-    """When news filter blocks, process_candle should return early."""
+@patch("main.data_feed")
+def test_blocked_by_news_filter(mock_data_feed, mock_news, mock_execution, tmp_path, monkeypatch):
+    mock_data_feed.get_account_info.return_value = {"equity": 10_000.0}
     mock_execution.count_open_trades.return_value = 0
-
-    # News filter blocks trading
+    mock_execution.get_open_positions.return_value = []
     mock_news.is_news_window.return_value = True
 
-    from risk_manager import RiskManager
-    state = BotState(
-        starting_balance=10_000.0,
-        model=MagicMock(),
-        label_encoder=MagicMock(),
-        risk=RiskManager(10_000.0),
-    )
+    state = _fresh_state(tmp_path)
+    state.risk.sync_counters_from_journal = lambda: None
+    monkeypatch.setattr("main.strategy.entry_session_ok", lambda ts: True)
 
-    with patch("main.data_feed.get_account_info", return_value={"equity": 10_000.0}), \
-            patch("risk_manager.is_rollover_window", return_value=False):
+    with patch("risk_manager.is_rollover_window", return_value=False), \
+         patch("risk_manager.is_no_trade_server_window", return_value=False):
         process_candle(state, dry_run=False)
 
-    # Should never reach order placement
+    mock_data_feed.get_ohlcv.assert_not_called()   # never reaches the strategy
     mock_execution.place_order.assert_not_called()
 
 
 @patch("main.execution")
 @patch("main.news_filter")
-def test_process_candle_blocked_by_drawdown(
-    mock_news, mock_execution,
-):
-    """When drawdown limit is breached, process_candle should return early."""
+@patch("main.data_feed")
+def test_blocked_by_kill_switch(mock_data_feed, mock_news, mock_execution, tmp_path):
+    """−3% equity → kill switch fires before any strategy/news work."""
+    mock_data_feed.get_account_info.return_value = {"equity": 9_690.0}
     mock_execution.count_open_trades.return_value = 0
+    mock_execution.get_open_positions.return_value = []
 
-    from risk_manager import RiskManager
-    state = BotState(
-        starting_balance=10_000.0,
-        model=MagicMock(),
-        label_encoder=MagicMock(),
-        risk=RiskManager(10_000.0),
-    )
+    state = _fresh_state(tmp_path)
+    state.risk.sync_counters_from_journal = lambda: None
 
-    with patch("main.data_feed.get_account_info", return_value={"equity": 9_000.0}), \
-            patch("execution.close_all_positions"):
+    with patch("execution.close_all_positions"):
         process_candle(state, dry_run=False)
 
-    # Should never call news filter or place order
+    assert state.risk.is_disabled()
     mock_news.is_news_window.assert_not_called()
     mock_execution.place_order.assert_not_called()
 
 
 @patch("main.execution")
 @patch("main.news_filter")
-def test_process_candle_rollover_blocks_trading(
-    mock_news, mock_execution,
-):
-    """When rollover window is active, can_trade() returns False."""
+@patch("main.data_feed")
+def test_blocked_outside_session(mock_data_feed, mock_news, mock_execution, tmp_path, monkeypatch):
+    mock_data_feed.get_account_info.return_value = {"equity": 10_000.0}
     mock_execution.count_open_trades.return_value = 0
+    mock_execution.get_open_positions.return_value = []
 
-    from risk_manager import RiskManager
-    state = BotState(
-        starting_balance=10_000.0,
-        model=MagicMock(),
-        label_encoder=MagicMock(),
-        risk=RiskManager(10_000.0),
-    )
+    state = _fresh_state(tmp_path)
+    state.risk.sync_counters_from_journal = lambda: None
+    monkeypatch.setattr("main.strategy.entry_session_ok", lambda ts: False)
 
-    with patch("main.data_feed.get_account_info", return_value={"equity": 10_000.0}), \
-            patch("risk_manager.is_rollover_window", return_value=True):
+    with patch("risk_manager.is_rollover_window", return_value=False), \
+         patch("risk_manager.is_no_trade_server_window", return_value=False):
         process_candle(state, dry_run=False)
 
     mock_news.is_news_window.assert_not_called()
     mock_execution.place_order.assert_not_called()
+
+
+@patch("main.execution")
+@patch("main.news_filter")
+@patch("main.data_feed")
+def test_wide_spread_skips_candidate(mock_data_feed, mock_news, mock_execution, tmp_path, monkeypatch):
+    mock_data_feed.get_account_info.return_value = {"equity": 10_000.0}
+    # 3-pip spread > MAX_SPREAD_PIPS (1.2)
+    mock_data_feed.get_latest_tick.return_value = {"ask": 1.1003, "bid": 1.1000}
+    mock_data_feed.get_ohlcv.return_value = pd.DataFrame({"close": [1.1]})
+    mock_execution.count_open_trades.return_value = 0
+    mock_execution.get_open_positions.return_value = []
+    mock_news.is_news_window.return_value = False
+
+    state = _fresh_state(tmp_path)
+    state.risk.sync_counters_from_journal = lambda: None
+    monkeypatch.setattr("main.strategy.entry_session_ok", lambda ts: True)
+    monkeypatch.setattr(
+        "main.strategy.generate_candidate", lambda m15, h1, params=None: _candidate()
+    )
+
+    with patch("risk_manager.is_rollover_window", return_value=False), \
+         patch("risk_manager.is_no_trade_server_window", return_value=False):
+        process_candle(state, dry_run=False)
+
+    mock_execution.place_order.assert_not_called()
+
+
+@patch("main.execution")
+@patch("main.news_filter")
+@patch("main.data_feed")
+def test_meta_veto_blocks_candidate(mock_data_feed, mock_news, mock_execution, tmp_path, monkeypatch):
+    """MetaVeto may block a rules candidate — and can never create one."""
+    mock_data_feed.get_account_info.return_value = {"equity": 10_000.0}
+    mock_data_feed.get_latest_tick.return_value = {"ask": 1.1001, "bid": 1.1000}
+    mock_data_feed.get_ohlcv.return_value = pd.DataFrame({"close": [1.1]})
+    mock_execution.count_open_trades.return_value = 0
+    mock_execution.get_open_positions.return_value = []
+    mock_news.is_news_window.return_value = False
+
+    veto = MagicMock()
+    veto.allow.return_value = False
+    state = _fresh_state(tmp_path, meta_veto=veto)
+    state.risk.sync_counters_from_journal = lambda: None
+    monkeypatch.setattr("main.strategy.entry_session_ok", lambda ts: True)
+    monkeypatch.setattr(
+        "main.strategy.generate_candidate", lambda m15, h1, params=None: _candidate()
+    )
+    monkeypatch.setattr(
+        "features.get_live_features", lambda symbol: pd.Series({"f": 1.0})
+    )
+
+    with patch("risk_manager.is_rollover_window", return_value=False), \
+         patch("risk_manager.is_no_trade_server_window", return_value=False):
+        process_candle(state, dry_run=False)
+
+    veto.allow.assert_called_once()
+    mock_execution.place_order.assert_not_called()
+
+
+@patch("main.execution")
+@patch("main.news_filter")
+@patch("main.data_feed")
+def test_no_candidate_no_trade(mock_data_feed, mock_news, mock_execution, tmp_path, monkeypatch):
+    mock_data_feed.get_account_info.return_value = {"equity": 10_000.0}
+    mock_data_feed.get_ohlcv.return_value = pd.DataFrame({"close": [1.1]})
+    mock_execution.count_open_trades.return_value = 0
+    mock_execution.get_open_positions.return_value = []
+    mock_news.is_news_window.return_value = False
+
+    state = _fresh_state(tmp_path)
+    state.risk.sync_counters_from_journal = lambda: None
+    monkeypatch.setattr("main.strategy.entry_session_ok", lambda ts: True)
+    monkeypatch.setattr(
+        "main.strategy.generate_candidate", lambda m15, h1, params=None: None
+    )
+
+    with patch("risk_manager.is_rollover_window", return_value=False), \
+         patch("risk_manager.is_no_trade_server_window", return_value=False):
+        process_candle(state, dry_run=False)
+
+    mock_execution.place_order.assert_not_called()
+
+
+@patch("main.execution")
+@patch("main.news_filter")
+@patch("main.data_feed")
+def test_live_order_placed_and_journalled(mock_data_feed, mock_news, mock_execution, tmp_path, monkeypatch):
+    mock_data_feed.get_account_info.return_value = {"equity": 10_000.0}
+    mock_data_feed.get_latest_tick.return_value = {"ask": 1.1001, "bid": 1.1000}
+    mock_data_feed.get_ohlcv.return_value = pd.DataFrame({"close": [1.1]})
+    mock_execution.count_open_trades.return_value = 0
+    mock_execution.get_open_positions.return_value = []
+    mock_execution.place_order.return_value = {"ticket": 42, "price": 1.1001}
+    mock_news.is_news_window.return_value = False
+
+    state = _fresh_state(tmp_path)
+    state.risk.sync_counters_from_journal = lambda: None
+    monkeypatch.setattr("main.strategy.entry_session_ok", lambda ts: True)
+    monkeypatch.setattr(
+        "main.strategy.generate_candidate", lambda m15, h1, params=None: _candidate()
+    )
+
+    with patch("main.trade_journal.log_trade") as mock_log, \
+         patch("risk_manager.is_rollover_window", return_value=False), \
+         patch("risk_manager.is_no_trade_server_window", return_value=False):
+        process_candle(state, dry_run=False)
+
+    mock_execution.place_order.assert_called_once()
+    args = mock_execution.place_order.call_args[0]
+    assert args[1] == 1                       # direction
+    assert args[3] > 0 and args[4] > 0        # SL and TP always present
+    mock_log.assert_called_once()
+    assert state.risk.trades_today == 1
+
+
+# ---------------------------------------------------------------------------
+# manage_positions — flatten before major news
+# ---------------------------------------------------------------------------
+
+@patch("main.execution")
+@patch("main.news_filter")
+def test_flattens_open_positions_before_major_news(mock_news, mock_execution, tmp_path):
+    from main import manage_positions
+
+    mock_execution.get_open_positions.return_value = [{"ticket": 1}]
+    mock_news.should_flatten_for_news.return_value = True
+
+    manage_positions(_fresh_state(tmp_path), dry_run=False)
+
+    mock_execution.close_all_positions.assert_called_once()
+    mock_execution.manage_breakeven.assert_not_called()
+
+
+@patch("main.execution")
+@patch("main.news_filter")
+def test_breakeven_managed_when_no_news(mock_news, mock_execution, tmp_path):
+    from main import manage_positions
+
+    mock_execution.get_open_positions.return_value = [{"ticket": 1}]
+    mock_news.should_flatten_for_news.return_value = False
+
+    manage_positions(_fresh_state(tmp_path), dry_run=False)
+
+    mock_execution.close_all_positions.assert_not_called()
+    mock_execution.manage_breakeven.assert_called_once()

@@ -182,7 +182,7 @@ class TestPlaceOrder:
 
         sent_req = mock_mt5.order_send.call_args[0][0]
         assert sent_req["magic"]   == config.BOT_MAGIC_NUMBER
-        assert sent_req["comment"] == "ML_BOT_V1"
+        assert sent_req["comment"] == config.BOT_LABEL
         assert sent_req["deviation"] == 10
 
     @patch("execution.time.sleep")
@@ -450,3 +450,108 @@ class TestCloseAllPositions:
     def test_no_positions_returns_zero(self, mock_get):
         mock_get.return_value = []
         assert close_all_positions() == 0
+
+
+# ---------------------------------------------------------------------------
+# Mandatory stop loss (The5ers: every order carries a broker-visible SL)
+# ---------------------------------------------------------------------------
+
+class TestMandatorySL:
+    @patch("execution.mt5")
+    def test_order_without_sl_rejected(self, mock_mt5):
+        assert place_order("EURUSD", 1, 0.10, None, 1.10750) is None
+        assert place_order("EURUSD", 1, 0.10, 0.0, 1.10750) is None
+        mock_mt5.order_send.assert_not_called()
+
+    @patch("execution.mt5")
+    def test_nan_sl_rejected(self, mock_mt5):
+        assert place_order("EURUSD", 1, 0.10, float("nan"), 1.10750) is None
+        mock_mt5.order_send.assert_not_called()
+
+    @patch("execution.mt5")
+    def test_sl_on_wrong_side_rejected(self, mock_mt5):
+        # Buy with SL above TP / sell with SL below TP → invalid geometry
+        assert place_order("EURUSD", 1, 0.10, 1.20000, 1.10750) is None
+        assert place_order("EURUSD", -1, 0.10, 1.05000, 1.10750) is None
+        mock_mt5.order_send.assert_not_called()
+
+    @patch("execution.get_broker")
+    def test_rejection_applies_before_broker_adapter_path(self, mock_get_broker, monkeypatch):
+        monkeypatch.setattr(config, "BROKER", "ctrader")
+        assert place_order("EURUSD", 1, 0.10, None, 1.10750) is None
+        mock_get_broker.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Breakeven management (rate-limited, once per ticket)
+# ---------------------------------------------------------------------------
+
+class TestManageBreakeven:
+    def _position(self, ticket=111, entry=1.1000, sl=1.0980):
+        return {
+            "ticket": ticket,
+            "symbol": "EURUSD",
+            "type": 0,  # buy
+            "volume": 0.10,
+            "open_price": entry,
+            "sl": sl,
+            "tp": 1.1040,
+            "open_time": None,
+            "profit": 0.0,
+        }
+
+    def setup_method(self):
+        execution._be_applied_tickets.clear()
+        execution._last_modify_time.clear()
+
+    @patch("execution.modify_position_sl", return_value=True)
+    @patch("data_feed.get_latest_tick")
+    @patch("execution.get_open_positions")
+    def test_moves_sl_to_entry_at_1r(self, mock_pos, mock_tick, mock_modify):
+        mock_pos.return_value = [self._position()]
+        # risk = 20 pips → trigger at entry + 20 pips = 1.1020
+        mock_tick.return_value = {"bid": 1.1021, "ask": 1.1022}
+
+        assert execution.manage_breakeven("EURUSD") == 1
+        mock_modify.assert_called_once_with(111, 1.1000)
+
+    @patch("execution.modify_position_sl", return_value=True)
+    @patch("data_feed.get_latest_tick")
+    @patch("execution.get_open_positions")
+    def test_not_moved_below_1r(self, mock_pos, mock_tick, mock_modify):
+        mock_pos.return_value = [self._position()]
+        mock_tick.return_value = {"bid": 1.1015, "ask": 1.1016}  # +0.75R only
+
+        assert execution.manage_breakeven("EURUSD") == 0
+        mock_modify.assert_not_called()
+
+    @patch("execution.modify_position_sl", return_value=True)
+    @patch("data_feed.get_latest_tick")
+    @patch("execution.get_open_positions")
+    def test_be_applied_only_once_per_ticket(self, mock_pos, mock_tick, mock_modify):
+        mock_pos.return_value = [self._position()]
+        mock_tick.return_value = {"bid": 1.1025, "ask": 1.1026}
+
+        assert execution.manage_breakeven("EURUSD") == 1
+        assert execution.manage_breakeven("EURUSD") == 0
+        assert mock_modify.call_count == 1
+
+    def test_modify_rate_limited_per_ticket(self, monkeypatch):
+        calls = []
+
+        class FakeBroker:
+            def modify_position_sl(self, ticket, sl):
+                calls.append((ticket, sl))
+                return True
+
+        monkeypatch.setattr(config, "BROKER", "ctrader")
+        monkeypatch.setattr(execution, "get_broker", lambda: FakeBroker())
+
+        assert execution.modify_position_sl(222, 1.1000) is True
+        # Immediate second modification for the same ticket → rate-limited
+        assert execution.modify_position_sl(222, 1.1001) is False
+        assert len(calls) == 1
+
+    def test_modify_never_removes_sl(self):
+        assert execution.modify_position_sl(333, 0.0) is False
+        assert execution.modify_position_sl(333, None) is False

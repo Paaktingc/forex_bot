@@ -1,0 +1,5 @@
+timestamp,config_id,split,params,reason,result,pooled_after_cost_ER,verdict
+2026-07-29T00:00:00+00:00,gate1_data_audit,all,"M15 4 pairs; tz/label/gaps/nulls/OHLC/coverage",Gate 1 data & timestamp validation,results/gate1_audit.txt,,PASS
+2026-07-29T00:00:00+00:00,gate3_frozen_v1,discovery,"ATR20;exp1.5;loc0.75;bo8;stop1.0ATR;tgt1.5R;time16;cd4h;sess08-16London;entry=next-bar-open",Gate 3 discovery test of the frozen signal (primary),results/gate3_discovery.txt,-0.2439,FAIL
+2026-07-29T00:00:00+00:00,diag_fade,discovery,"frozen signal, direction FLIPPED",Diagnostic: rule out a sign bug — fade is also negative and not a mirror,results/gate3_discovery.txt,-0.2967,FAIL (diagnostic)
+2026-07-29T00:00:00+00:00,diag_zero_cost,discovery,"frozen signal cost_mult=0; instant vs next-bar entry",Diagnostic: management is fair (random ~-0.008); signal instant +0.025 but next-bar -0.047,results/gate3_discovery.txt,-0.0470,FAIL (diagnostic)

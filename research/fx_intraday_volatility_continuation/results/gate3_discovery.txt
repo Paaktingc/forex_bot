@@ -1,0 +1,52 @@
+============================================================================================
+GATE 3 — discovery 2007-01-01..2018-12-31  (frozen signal, after-cost verdicts)
+============================================================================================
+
+EURUSD: n=4107 (342/yr)  E[R]net=-0.1819 gross=-0.0470 costdrag=0.1349
+  med=-1.103 sd=1.278 WR=0.380 PF=0.751 maxDD=747.0R streak=16
+  iid95%[-0.2212,-0.1433] block95%[-0.2210,-0.1431]
+  long n=1981 E[R]=-0.1711  short n=2126 E[R]=-0.1920
+  by year: 2007:-0.35 2008:+0.00 2009:-0.08 2010:+0.06 2011:+0.00 2012:-0.22 2013:-0.26 2014:-0.42 2015:-0.24 2016:-0.25 2017:-0.22 2018:-0.19
+
+GBPUSD: n=3959 (330/yr)  E[R]net=-0.2363 gross=-0.1057 costdrag=0.1306
+  med=-1.091 sd=1.242 WR=0.350 PF=0.682 maxDD=939.1R streak=17
+  iid95%[-0.2751,-0.1971] block95%[-0.2746,-0.1965]
+  long n=1904 E[R]=-0.2120  short n=2055 E[R]=-0.2588
+  by year: 2007:-0.07 2008:-0.10 2009:-0.08 2010:-0.21 2011:-0.21 2012:-0.38 2013:-0.34 2014:-0.41 2015:-0.22 2016:-0.21 2017:-0.39 2018:-0.17
+
+AUDUSD: n=1232 (308/yr)  E[R]net=-0.3378 gross=-0.1280 costdrag=0.2098
+  med=-1.183 sd=1.258 WR=0.338 PF=0.586 maxDD=424.4R streak=13
+  iid95%[-0.4075,-0.2685] block95%[-0.4124,-0.2620]
+  long n=583 E[R]=-0.3126  short n=649 E[R]=-0.3604
+  by year: 2015:-0.07 2016:-0.29 2017:-0.49 2018:-0.50
+
+USDJPY: n=1257 (314/yr)  E[R]net=-0.3784 gross=-0.1645 costdrag=0.2140
+  med=-1.183 sd=1.245 WR=0.329 PF=0.547 maxDD=478.9R streak=12
+  iid95%[-0.4471,-0.3098] block95%[-0.4444,-0.3129]
+  long n=616 E[R]=-0.4108  short n=641 E[R]=-0.3473
+  by year: 2015:-0.36 2016:-0.25 2017:-0.45 2018:-0.45
+
+--------------------------------------------------------------------------------------------
+POOLED 4-pair: n=10555 E[R]=-0.2439 PF=0.678 iid95%(-0.2685, -0.2197)
+POOLED non-EURUSD: n=6448 E[R]=-0.2834 PF=0.635 iid95%(-0.3137, -0.2527)
+leave-one-out pooled E[R]:
+  drop EURUSD: E[R]=-0.2834 (n=6448)
+  drop GBPUSD: E[R]=-0.2485 (n=6596)
+  drop AUDUSD: E[R]=-0.2315 (n=9323)
+  drop USDJPY: E[R]=-0.2257 (n=9298)
+remove best pair (EURUSD): pooled E[R]=-0.2834
+remove best year (2008): pooled E[R]=-0.2566
+top 1% winners contribute 1.0% of gross wins (37 trades)
+top 5% winners contribute 5.1% of gross wins (188 trades)
+top 10% winners contribute 10.3% of gross wins (377 trades)
+
+--------------------------------------------------------------------------------------------
+BASELINES (pooled, after-cost):
+  matched-random: mean=-0.2293 95%[-0.2529,-0.2058]  P(random>=strategy)=0.887  strategy pct-rank=11.3
+  shuffled-label: mean=-0.2605 95%[-0.2815,-0.2392]  P(shuffle>=strategy)=0.062
+  unconditional session continuation: n=16588 E[R]=-0.2581 (strategy -0.2439; improvement +0.0142)
+
+portfolio frequency ~1320 trades/year  bucket=>600
+
+============================================================================================
+GATE 3 FAILED. pooled after-cost E[R] non-positive; pooled non-EURUSD E[R] negative; does not beat matched-random at 95%; does not beat shuffled-label at 95%

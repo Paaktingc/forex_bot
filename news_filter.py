@@ -2,8 +2,17 @@
 news_filter.py
 
 Scrapes Forex Factory or similar economic calendar to find high-impact news times.
-Enforces the no-trading window (e.g., 30 mins before/after).
-Returns True when trading should be BLOCKED (fail closed).
+
+Tiered no-entry windows (The5ers Bootcamp safe policy):
+  - any high-impact EUR/USD event:            ±NEWS_BUFFER_MINS (30 min)
+  - MAJOR events (NFP, US CPI, FOMC, ECB):    ±NEWS_MAJOR_BUFFER_MINS (60 min)
+    plus flatten open positions NEWS_FLATTEN_BEFORE_MINS (15 min) before.
+
+FAIL CLOSED: if the calendar cannot be fetched OR fetches but parses to zero
+events (layout change), trading is treated as inside a blackout.
+
+Pending orders near news are never used: the bot places market orders only
+(bracketing/straddles are prohibited — enforced in execution.py by design).
 """
 
 import logging
@@ -12,14 +21,48 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import pandas as pd
 import config
 
 logger = logging.getLogger(__name__)
 
+
+def _news_source_tz() -> ZoneInfo:
+    """The IANA timezone Forex Factory renders event times in (config)."""
+    try:
+        return ZoneInfo(getattr(config, "NEWS_SOURCE_TZ", "UTC"))
+    except Exception:
+        logger.error(
+            "Invalid NEWS_SOURCE_TZ=%r — falling back to UTC.",
+            getattr(config, "NEWS_SOURCE_TZ", None),
+        )
+        return ZoneInfo("UTC")
+
 CACHE_FILE = config.DATA_DIR / "news_cache.json"
 CACHE_EXPIRY_HOURS = 6
 FF_CALENDAR_URL = "https://www.forexfactory.com/calendar"
+
+# Events that get the wider ±60 min window and the flatten-15-min-before rule.
+MAJOR_EVENT_KEYWORDS = (
+    "non-farm",
+    "nonfarm",
+    "nfp",
+    "cpi",
+    "fomc",
+    "federal funds rate",
+    "ecb",
+    "main refinancing rate",
+)
+MAJOR_EVENT_CURRENCIES = {"USD", "EUR"}
+
+
+def is_major_event(event_name: str, currency: str = "") -> bool:
+    """True for NFP, US CPI, FOMC, and ECB rate decisions/pressers."""
+    name = str(event_name).lower()
+    if currency and str(currency).upper() not in MAJOR_EVENT_CURRENCIES:
+        return False
+    return any(keyword in name for keyword in MAJOR_EVENT_KEYWORDS)
 
 def _parse_ff_html(html: str) -> pd.DataFrame:
     """Parses Forex Factory HTML and returns a DataFrame of high-impact events."""
@@ -77,11 +120,16 @@ def _parse_ff_html(html: str) -> pd.DataFrame:
             try:
                 # e.g., "2023 Sep 25 10:30am"
                 dt_naive = datetime.strptime(datetime_str, "%Y %b %d %I:%M%p")
-                
-                # Assume parsed time is in UTC for simplicity.
-                # In a robust production environment, one would force a timezone cookie on FF.
-                dt_utc = dt_naive.replace(tzinfo=timezone.utc)
-                
+
+                # Forex Factory renders times in the account/cookie timezone
+                # (config.NEWS_SOURCE_TZ), NOT UTC. Localize to that zone, then
+                # convert to UTC so downstream blackout math is correct
+                # regardless of how the FF session is configured (Finding 3).
+                dt_utc = (
+                    dt_naive.replace(tzinfo=_news_source_tz())
+                    .astimezone(timezone.utc)
+                )
+
                 events.append({
                     "datetime_utc": dt_utc,
                     "currency": currency,
@@ -147,49 +195,91 @@ def fetch_forex_factory_calendar() -> pd.DataFrame:
         logger.error(f"Error fetching Forex Factory calendar: {e}")
         raise RuntimeError("News Scraping Failed")
 
-def is_news_window(symbol: str, buffer_mins: int = 30) -> bool:
+def _load_calendar_fail_closed(symbol: str) -> pd.DataFrame | None:
     """
-    Checks if a high-impact news event violates the buffer limits.
-    If scraping fails, returns True (blocks trading).
-    
-    Args:
-        symbol (str): e.g., "EURUSD"
-        buffer_mins (int): minutes before and after
-        
-    Returns:
-        bool: True if inside a news window or failure (do NOT trade), False otherwise (safe to trade).
+    Returns the relevant-currency event frame, or None to signal BLACKOUT
+    (fetch failed or calendar parsed to zero events — fail closed).
     """
     try:
         df = fetch_forex_factory_calendar()
     except Exception:
-        logger.error("Scraping failed inside is_news_window. Failing closed (blocking trading).")
-        return True
-        
+        logger.error("News calendar unavailable. Failing closed (blocking trading).")
+        return None
+
     if df is None or df.empty:
-        return False
-        
-    # Extract currencies
-    # Assuming standard 6-char pairs like EURUSD, GBPJPY
+        logger.error(
+            "News calendar fetched but contains ZERO events — treating as a "
+            "parser/layout failure and failing closed (blocking trading)."
+        )
+        return None
+
     c1 = symbol[:3]
     c2 = symbol[3:6]
-    
+    return df[df["currency"].isin([c1, c2])]
+
+
+def _minutes_from_event(row, now: datetime) -> float:
+    dt_news = row["datetime_utc"]
+    if dt_news.tzinfo is None:
+        dt_news = dt_news.replace(tzinfo=timezone.utc)
+    return (dt_news - now).total_seconds() / 60.0
+
+
+def is_news_window(symbol: str, buffer_mins: int | None = None) -> bool:
+    """
+    True when trading should be BLOCKED:
+      - inside ±buffer_mins (default NEWS_BUFFER_MINS) of any high-impact
+        event for the symbol's currencies,
+      - inside ±NEWS_MAJOR_BUFFER_MINS of a MAJOR event (NFP/CPI/FOMC/ECB),
+      - or when the calendar is unavailable/empty (fail closed).
+    """
+    if buffer_mins is None:
+        buffer_mins = config.NEWS_BUFFER_MINS
+
+    df_sym = _load_calendar_fail_closed(symbol)
+    if df_sym is None:
+        return True
+
     now = datetime.now(timezone.utc)
-    
-    # Filter for relevant currencies
-    df_sym = df[df['currency'].isin([c1, c2])]
-    
     for _, row in df_sym.iterrows():
-        dt_news = row['datetime_utc']
-        # Depending on how the dataframe was constructed, it might be tz-naive. Ensure UTC.
-        if dt_news.tzinfo is None:
-            dt_news = dt_news.replace(tzinfo=timezone.utc)
-            
-        diff_mins = abs((now - dt_news).total_seconds()) / 60.0
-        
-        if diff_mins <= buffer_mins:
-            logger.warning(f"News block: {row['event']} in {diff_mins:.1f} minutes")
+        window = (
+            config.NEWS_MAJOR_BUFFER_MINS
+            if is_major_event(row["event"], row["currency"])
+            else buffer_mins
+        )
+        diff_mins = abs(_minutes_from_event(row, now))
+        if diff_mins <= window:
+            logger.warning(
+                f"News block: {row['event']} within ±{window} min "
+                f"({diff_mins:.1f} min away)"
+            )
             return True
-            
+
+    return False
+
+
+def should_flatten_for_news(symbol: str) -> bool:
+    """
+    True when open positions must be CLOSED because a MAJOR event
+    (NFP/US CPI/FOMC/ECB) starts within NEWS_FLATTEN_BEFORE_MINS minutes.
+    Fails closed: calendar unavailable ⇒ flatten.
+    """
+    df_sym = _load_calendar_fail_closed(symbol)
+    if df_sym is None:
+        return True
+
+    now = datetime.now(timezone.utc)
+    for _, row in df_sym.iterrows():
+        if not is_major_event(row["event"], row["currency"]):
+            continue
+        minutes_until = _minutes_from_event(row, now)
+        if 0 <= minutes_until <= config.NEWS_FLATTEN_BEFORE_MINS:
+            logger.warning(
+                f"MAJOR news flatten: {row['event']} in {minutes_until:.1f} min "
+                f"— closing open positions."
+            )
+            return True
+
     return False
 
 def get_next_news_event(symbol: str) -> dict | None:

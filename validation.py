@@ -700,3 +700,131 @@ def detect_lookahead_bias(df: pd.DataFrame, feature_cols: List[str], label_col: 
     if not warnings_list:
         warnings_list.append("No lookahead-bias heuristics triggered.")
     return warnings_list
+
+
+# ===========================================================================
+# Rules-strategy walk-forward (The5ers Bootcamp)
+# ===========================================================================
+
+def walk_forward_rules(
+    df_m15: pd.DataFrame,
+    df_h1: pd.DataFrame,
+    train_months: int = 24,
+    test_months: int = 6,
+    step_months: int = 6,
+    perturb: bool = True,
+    starting_balance: float = 10_000.0,
+) -> List[Dict[str, Any]]:
+    """
+    Rolling walk-forward evaluation of the RULES strategy (no model fitting):
+    24-month train window (context/verification) + 6-month out-of-sample test
+    window, rolled forward 6 months at a time.
+
+    Robustness perturbation (the edge must survive parameter noise):
+      - SL ATR multiplier 1.25–1.75
+      - regime/pullback EMA spans ±20%
+      - RSI trigger level 45–55
+    Each fold reports base-parameter metrics plus the perturbed PF range.
+    """
+    import config as _config
+    import strategy as _strategy
+    from backtest import RulesBacktestEngine
+
+    def _to_utc(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        if not isinstance(out.index, pd.DatetimeIndex):
+            out.index = pd.to_datetime(out.index, utc=True)
+        elif out.index.tz is None:
+            out.index = out.index.tz_localize("UTC")
+        return out.sort_index()
+
+    df_m15 = _to_utc(df_m15)
+    df_h1 = _to_utc(df_h1)
+
+    start = df_m15.index[0]
+    end = df_m15.index[-1]
+
+    perturbed_params: List[_strategy.StrategyParams] = []
+    if perturb:
+        for sl_mult in (1.25, 1.75):
+            for ema_scale in (0.8, 1.2):
+                for rsi_level in (45.0, 55.0):
+                    perturbed_params.append(
+                        _strategy.StrategyParams(
+                            ema_fast_h1=int(round(50 * ema_scale)),
+                            ema_slow_h1=int(round(200 * ema_scale)),
+                            ema_pullback=int(round(20 * ema_scale)),
+                            rsi_level=rsi_level,
+                            sl_atr_mult=sl_mult,
+                        )
+                    )
+
+    results: List[Dict[str, Any]] = []
+    fold = 0
+    train_start = start
+    while True:
+        train_end = train_start + pd.DateOffset(months=train_months)
+        test_end = train_end + pd.DateOffset(months=test_months)
+        if train_end >= end:
+            break
+        fold += 1
+
+        test_m15 = df_m15.loc[train_end:min(test_end, end)]
+        # H1 history reaches back through the train window so EMA200/regime
+        # indicators are warm at the first test bar (no lookahead: all data
+        # strictly precedes each simulated decision).
+        h1_context = df_h1.loc[:min(test_end, end)]
+        m15_warm = df_m15.loc[train_end - pd.DateOffset(days=30):min(test_end, end)]
+
+        if len(test_m15) < 500:
+            break
+
+        def _run(params: "_strategy.StrategyParams | None") -> Dict[str, Any]:
+            engine = RulesBacktestEngine(
+                m15_warm, h1_context, params=params, starting_balance=starting_balance
+            )
+            metrics = engine.run()
+            # Drop warm-up trades that closed before the true test window
+            trades = [t for t in engine.trades if t["entry_time"] >= train_end]
+            import numpy as _np
+            from monte_carlo_dd import trade_stats as _stats
+
+            pct = _np.array([t["pct_return"] for t in trades], dtype=float)
+            r = _np.array([t["r_multiple"] for t in trades], dtype=float)
+            fold_metrics = _stats(pct, r)
+            fold_metrics["total_return_pct"] = round(
+                float((_np.prod(1.0 + pct) - 1.0) * 100.0) if pct.size else 0.0, 2
+            )
+            fold_metrics["kill_switch_hit"] = metrics["kill_switch_hit"]
+            return fold_metrics
+
+        base = _run(None)
+        base.update(
+            {
+                "fold": fold,
+                "train_start": str(train_start.date()),
+                "train_end": str(train_end.date()),
+                "test_start": str(train_end.date()),
+                "test_end": str(min(test_end, end).date()),
+            }
+        )
+
+        if perturbed_params:
+            pf_values = []
+            sl_mult_original = _config.SL_ATR_MULT
+            try:
+                for params in perturbed_params:
+                    _config.SL_ATR_MULT = params.sl_atr_mult
+                    pf = _run(params)["profit_factor"]
+                    if pf != float("inf"):
+                        pf_values.append(pf)
+            finally:
+                _config.SL_ATR_MULT = sl_mult_original
+            if pf_values:
+                base["perturbed_pf_range"] = (min(pf_values), max(pf_values))
+                base["perturbed_pf_min"] = min(pf_values)
+
+        results.append(base)
+        train_start = train_start + pd.DateOffset(months=step_months)
+
+    return results

@@ -92,15 +92,16 @@ def test_run_builds_features_with_strict_prefix_only(dummy_artifacts, monkeypatc
 @pytest.mark.parametrize(
     ("exit_bar", "bar_updates", "expected_reason", "expected_result"),
     [
+        # ATR = 10 pips → SL = 1.5×ATR = 15 pips below entry, TP = 2R = 30 pips above
         (
             102,
-            {"high": 1.1025, "low": 1.1005, "close": 1.1010},
+            {"high": 1.1035, "low": 1.1005, "close": 1.1010},
             "TP",
             "WIN",
         ),
         (
             102,
-            {"high": 1.1005, "low": 1.0990, "close": 1.0995},
+            {"high": 1.1005, "low": 1.0985, "close": 1.0990},
             "SL",
             "LOSS",
         ),
@@ -256,10 +257,10 @@ def test_walk_forward_validation_returns_five_windows_plus_average(dummy_artifac
     assert results[-1]["total_return_pct"] == 3.0
 
 
-def test_main_logs_error_when_csvs_are_missing(monkeypatch, tmp_path, caplog):
+def test_legacy_main_logs_error_when_csvs_are_missing(monkeypatch, tmp_path, caplog):
     monkeypatch.setattr(backtest.config, "DATA_DIR", tmp_path / "missing_data")
     caplog.set_level("ERROR")
 
-    backtest.main()
+    backtest._legacy_model_main()
 
     assert "Failed to load historical CSVs" in caplog.text
